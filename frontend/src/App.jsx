@@ -1,20 +1,47 @@
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useMemo, useState } from "react";
 
-// Resolve API base once at build/runtime.
-const API_BASE =
-  (typeof import !== "undefined" &&
-    import.meta &&
+/** Decide API base:
+ * 1) Use VITE_API_BASE when injected by Vite (Render)
+ * 2) Else if running on localhost, use the local FastAPI port
+ * 3) Else safe production fallback
+ */
+const resolvedApiBase =
+  (typeof import.meta !== "undefined" &&
     import.meta.env &&
     import.meta.env.VITE_API_BASE) ||
-  "https://doublehelix.onrender.com"; // safe fallback
+  (typeof window !== "undefined" &&
+  window.location.hostname.includes("localhost")
+    ? "http://localhost:8000"
+    : "https://doublehelix.onrender.com");
+
+// Safer URL builder (avoids double/missing slashes)
+function apiURL(path) {
+  return new URL(path.replace(/^\/*/, "/"), resolvedApiBase).toString();
+}
 
 async function getJSON(path, opts) {
-  const res = await fetch(`${API_BASE}${path}`, opts);
-  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+  const res = await fetch(apiURL(path), opts);
+  if (!res.ok) {
+    const txt = await res.text().catch(() => "");
+    throw new Error(`GET ${path} → ${res.status} ${res.statusText} ${txt}`);
+  }
+  return res.json();
+}
+function apiURL(path) {
+  return new URL(path.replace(/^\/*/, "/"), resolvedApiBase).toString();
+}
+
+async function getJSON(path, opts) {
+  const res = await fetch(apiURL(path), opts);
+  if (!res.ok) {
+    const txt = await res.text().catch(() => "");
+    throw new Error(`GET ${path} → ${res.status} ${res.statusText} ${txt}`);
+  }
   return res.json();
 }
 
 export default function App() {
+  const API_BASE = useMemo(() => resolvedApiBase, []);
   const [health, setHealth] = useState("checking...");
   const [policy, setPolicy] = useState({
     vector: {},
@@ -26,26 +53,38 @@ export default function App() {
   const [goals, setGoals] = useState([]);
   const [newGoal, setNewGoal] = useState("");
   const [emergence, setEmergence] = useState(null);
+  const [error, setError] = useState(null);
 
   async function refresh() {
+    setError(null);
     try {
       const d = await getJSON("/health");
-      setHealth(d.status);
-    } catch {
+      setHealth(d.status ?? "ok");
+    } catch (e) {
       setHealth("error");
+      setError(String(e));
     }
+
     try {
       const p = await getJSON("/policy");
       setPolicy(p);
-    } catch {}
+    } catch (e) {
+      setError((prev) => prev || String(e));
+    }
+
     try {
       const g = await getJSON("/goals");
       setGoals(g.items || []);
-    } catch {}
+    } catch (e) {
+      setError((prev) => prev || String(e));
+    }
+
     try {
       const e = await getJSON("/emergence");
       setEmergence(e);
-    } catch {}
+    } catch (e) {
+      setError((prev) => prev || String(e));
+    }
   }
 
   useEffect(() => {
@@ -54,23 +93,38 @@ export default function App() {
 
   async function addGoal() {
     if (!newGoal.trim()) return;
-    await fetch(`${API_BASE}/goals`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ text: newGoal }),
-    });
-    setNewGoal("");
-    refresh();
+    setError(null);
+    try {
+      await fetch(apiURL("/goals"), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text: newGoal }),
+      });
+      setNewGoal("");
+      refresh();
+    } catch (e) {
+      setError(String(e));
+    }
   }
 
   async function activateGoal(id) {
-    await fetch(`${API_BASE}/goals/${id}/activate`, { method: "POST" });
-    refresh();
+    setError(null);
+    try {
+      await fetch(apiURL(`/goals/${id}/activate`), { method: "POST" });
+      refresh();
+    } catch (e) {
+      setError(String(e));
+    }
   }
 
   async function tick() {
-    await fetch(`${API_BASE}/tick`, { method: "POST" });
-    refresh();
+    setError(null);
+    try {
+      await fetch(apiURL("/tick"), { method: "POST" });
+      refresh();
+    } catch (e) {
+      setError(String(e));
+    }
   }
 
   return (
@@ -80,16 +134,22 @@ export default function App() {
         Emergence: consolidation • curiosity • multi-scale • prompt evolution • perspectives
       </div>
 
-      <div className="grid">
-        <div className="card">
-          <h3>System</h3>
-          <div className="row">
-            <span className="pill">health: {health}</span>
-            <button className="pill" onClick={refresh}>Refresh</button>
-            <button className="pill" onClick={tick}>Planner Tick</button>
-          </div>
+      {/* Tiny status row for quick debugging */}
+      <div className="row" style={{ marginBottom: 8 }}>
+        <span className="pill">API: {API_BASE}</span>
+        <span className="pill">health: {health}</span>
+        {error && <span className="pill" style={{ background: "#522" }}>err</span>}
+        <button className="pill" onClick={refresh}>Refresh</button>
+        <button className="pill" onClick={tick}>Planner Tick</button>
+      </div>
+      {error && (
+        <div className="card" style={{ borderColor: "#a44" }}>
+          <strong>Error</strong>
+          <pre style={{ whiteSpace: "pre-wrap" }}>{error}</pre>
         </div>
+      )}
 
+      <div className="grid">
         <div className="card">
           <h3>Policy</h3>
           <div className="row">
