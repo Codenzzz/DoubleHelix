@@ -1,8 +1,9 @@
 import os, time, json, re, itertools, threading
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any, Tuple, Optional
 from dotenv import load_dotenv
 
 from providers import complete_many, reflect_json
@@ -24,7 +25,6 @@ if not _origins_env:
     _origins_env = [
         "http://localhost:5173",
         "https://doublehelix-front.onrender.com",
-        "https://doublehelix-frount.onrender.com",
     ]
 
 app.add_middleware(
@@ -260,7 +260,7 @@ def _run_tool(obj: Dict[str, Any]) -> str:
 # -----------------------------------------------------
 class ChatPayload(BaseModel):
     prompt: str
-    model: str | None = None
+    model: Optional[str] = None
     use_perspectives: bool = False
 
 @app.post("/chat")
@@ -381,6 +381,52 @@ def emergence_status():
         "total_interactions": metrics.get("total_replies", 0),
         "current_policy": db.get_policy_vector(),
     }
+
+# -----------------------------------------------------
+#  Policy Endpoints
+# -----------------------------------------------------
+class PolicyVector(BaseModel):
+    creativity: float = 0.0
+    conciseness: float = 0.0
+    skepticism: float = 0.0
+    planning_focus: float = 0.0
+
+@app.get("/policy")
+def api_get_policy():
+    return JSONResponse(db.get_policy_vector())
+
+@app.post("/policy")
+def api_set_policy(vec: PolicyVector):
+    db.set_policy_vector(vec.model_dump())
+    return {"status": "ok", "policy": vec.model_dump()}
+
+@app.get("/policy/history")
+def api_policy_history(limit: int = 20):
+    return {"history": db.get_policy_history(last=limit)}
+
+# -----------------------------------------------------
+#  Goals Endpoints
+# -----------------------------------------------------
+class GoalIn(BaseModel):
+    text: str
+
+@app.get("/goals")
+def api_goals_list():
+    return {"goals": db.goals_list()}
+
+@app.post("/goals")
+def api_goals_add(payload: GoalIn):
+    gid = db.goals_add(payload.text)
+    return {"status": "ok", "id": gid}
+
+@app.post("/goals/{goal_id}/activate")
+def api_goals_activate(goal_id: int):
+    db.goals_activate(goal_id)
+    return {"status": "ok", "active": goal_id}
+
+@app.get("/goals/active")
+def api_goal_active():
+    return {"active": db.goal_active()}
 
 # -----------------------------------------------------
 #  AutoTick Background Thread
