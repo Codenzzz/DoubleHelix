@@ -29,7 +29,7 @@ async function postJSON(path, body, opts = {}) {
   const res = await fetch(apiURL(path), {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
+    body: body !== undefined ? JSON.stringify(body) : undefined,
     ...opts,
   });
   if (!res.ok) {
@@ -43,17 +43,26 @@ async function postJSON(path, body, opts = {}) {
 export default function App() {
   const API_BASE = useMemo(() => resolvedApiBase, []);
   const [health, setHealth] = useState("checking...");
-  const [policy, setPolicy] = useState({
-    vector: {},
-    reward: 0,
-    history: [],
-    meta: [],
-    metrics: {},
-  });
+  const [error, setError] = useState(null);
+
+  // Policy
+  const [policyVector, setPolicyVector] = useState({});
+  const [policyHistory, setPolicyHistory] = useState([]);
+  const [metrics, setMetrics] = useState(null);
+
+  // Goals
   const [goals, setGoals] = useState([]);
   const [newGoal, setNewGoal] = useState("");
+
+  // Emergence
   const [emergence, setEmergence] = useState(null);
-  const [error, setError] = useState(null);
+
+  // Clean Eyes
+  const [cleanPreview, setCleanPreview] = useState(null);
+  const [cleanAlpha, setCleanAlpha] = useState(""); // blank = backend default
+
+  // History buffer (from KV)
+  const [history, setHistory] = useState([]);
 
   // Chat state
   const [chatInput, setChatInput] = useState("");
@@ -64,38 +73,74 @@ export default function App() {
 
   async function refresh() {
     setError(null);
+
+    // Health
     try {
       const d = await getJSON("/health");
       setHealth(d.status ?? "ok");
     } catch (e) {
       setHealth("error");
-      setError(String(e));
+      setError((prev) => prev || String(e));
     }
 
+    // Policy (vector), history, and metrics (from /emergence)
     try {
-      const p = await getJSON("/policy");
-      setPolicy(p);
+      const pv = await getJSON("/policy"); // backend returns the vector directly
+      setPolicyVector(pv || {});
     } catch (e) {
       setError((prev) => prev || String(e));
     }
 
+    try {
+      const ph = await getJSON("/policy/history?limit=40");
+      setPolicyHistory(ph?.history || []);
+    } catch (e) {
+      setError((prev) => prev || String(e));
+    }
+
+    // Goals
     try {
       const g = await getJSON("/goals");
-      setGoals(g.items || []);
+      setGoals(g?.goals || []); // backend shape: { goals: [...] }
     } catch (e) {
       setError((prev) => prev || String(e));
     }
 
+    // Emergence (also includes metrics snapshot + illusion)
     try {
       const em = await getJSON("/emergence");
       setEmergence(em);
+      setMetrics({
+        avg_reply_score: em?.avg_reply_score,
+        total_interactions: em?.total_interactions,
+        policy_stability: em?.policy_stability,
+      });
     } catch (e) {
       setError((prev) => prev || String(e));
+    }
+
+    // History buffer
+    try {
+      const h = await getJSON("/history?limit=80");
+      setHistory(h?.history || []);
+    } catch (e) {
+      setError((prev) => prev || String(e));
+    }
+
+    // Clean Eyes preview (optional)
+    try {
+      const ce = await getJSON(
+        cleanAlpha ? `/clean/preview?alpha=${encodeURIComponent(cleanAlpha)}` : "/clean/preview"
+      );
+      setCleanPreview(ce || null);
+    } catch {
+      // not fatal
     }
   }
 
   useEffect(() => {
     refresh();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   async function addGoal() {
@@ -125,6 +170,30 @@ export default function App() {
     try {
       await fetch(apiURL("/tick"), { method: "POST" });
       refresh();
+    } catch (e) {
+      setError(String(e));
+    }
+  }
+
+  async function previewCleanEyes() {
+    try {
+      const ce = await getJSON(
+        cleanAlpha ? `/clean/preview?alpha=${encodeURIComponent(cleanAlpha)}` : "/clean/preview"
+      );
+      setCleanPreview(ce || null);
+    } catch (e) {
+      setError(String(e));
+    }
+  }
+
+  async function applyCleanEyes() {
+    try {
+      const body = cleanAlpha ? { method: "POST" } : { method: "POST" };
+      const url = cleanAlpha
+        ? `/clean/apply?alpha=${encodeURIComponent(cleanAlpha)}`
+        : "/clean/apply";
+      await postJSON(url, undefined, body);
+      await refresh();
     } catch (e) {
       setError(String(e));
     }
@@ -163,11 +232,16 @@ export default function App() {
     }
   }
 
+  // Helpers
+  const activeGoalObj =
+    goals.find((g) => g.active) ||
+    null;
+
   return (
     <div className="container">
-      <div className="title">🧬 DoubleHelix v0.8.1</div>
+      <div className="title">🧬 DoubleHelix v0.9.0</div>
       <div className="subtitle">
-        Emergence: consolidation • curiosity • multi-scale • prompt evolution • perspectives
+        Emergence: consolidation • curiosity • multi-scale • prompt evolution • perspectives • clean eyes • reality bridge
       </div>
 
       {/* Debug row */}
@@ -178,6 +252,13 @@ export default function App() {
         <button className="pill" onClick={refresh}>Refresh</button>
         <button className="pill" onClick={tick}>Planner Tick</button>
       </div>
+
+      {activeGoalObj && (
+        <div className="card" style={{ borderColor: "#2a6" }}>
+          <strong>Active Goal</strong>
+          <div style={{ marginTop: 6 }}>{activeGoalObj.text}</div>
+        </div>
+      )}
 
       {error && (
         <div className="card" style={{ borderColor: "#a44" }}>
@@ -191,14 +272,13 @@ export default function App() {
         <div className="card">
           <h3>Policy</h3>
           <div className="row">
-            <span className="pill">reward: {policy.reward}</span>
-            <span className="pill">history: {policy.history?.length || 0}</span>
+            <span className="pill">history: {policyHistory?.length || 0}</span>
           </div>
-          <pre>{JSON.stringify(policy.vector || {}, null, 2)}</pre>
-          {policy.metrics && (
+          <pre>{JSON.stringify(policyVector || {}, null, 2)}</pre>
+          {metrics && (
             <>
               <h3 style={{ marginTop: 12 }}>Metrics</h3>
-              <pre>{JSON.stringify(policy.metrics, null, 2)}</pre>
+              <pre>{JSON.stringify(metrics, null, 2)}</pre>
             </>
           )}
         </div>
@@ -220,7 +300,7 @@ export default function App() {
               <div key={g.id} className="row" style={{ marginBottom: 6, gap: 8 }}>
                 <span className="pill">#{g.id}</span>
                 <span style={{ flex: 1 }}>{g.text}</span>
-                <span className="pill">active: {String(g.active)}</span>
+                <span className="pill">{g.active ? "active" : "inactive"}</span>
                 {!g.active && (
                   <button className="ghost" onClick={() => activateGoal(g.id)}>
                     Activate
@@ -235,9 +315,69 @@ export default function App() {
         {/* Emergence */}
         <div className="card">
           <h3>Emergence</h3>
-          <pre>{emergence ? JSON.stringify(emergence, null, 2) : "(no data yet)"}</pre>
-          <div className="muted">
-            This aggregates meta signals like emergent principles, policy stability, and scores.
+          <div className="row" style={{ gap: 8, flexWrap: "wrap" }}>
+            <span className="pill">
+              births: {emergence?.emergent_principles ?? 0}
+            </span>
+            <span className="pill">
+              surprise: {typeof emergence?.surprise === "number" ? emergence.surprise.toFixed(3) : "-"}
+            </span>
+          </div>
+          {!!emergence?.illusion && (
+            <details style={{ marginTop: 8 }}>
+              <summary style={{ cursor: "pointer" }}>illusion (dream/recall)</summary>
+              <pre style={{ margin: 0 }}>
+                {JSON.stringify(emergence.illusion, null, 2)}
+              </pre>
+            </details>
+          )}
+          <details style={{ marginTop: 8 }}>
+            <summary style={{ cursor: "pointer" }}>raw emergence</summary>
+            <pre style={{ margin: 0 }}>
+              {emergence ? JSON.stringify(emergence, null, 2) : "(no data yet)"}
+            </pre>
+          </details>
+        </div>
+
+        {/* Clean Eyes */}
+        <div className="card">
+          <h3>Clean Eyes (policy-only)</h3>
+          <div className="row" style={{ gap: 8, flexWrap: "wrap" }}>
+            <input
+              className="pill"
+              style={{ width: 120 }}
+              placeholder="alpha (0..1)"
+              value={cleanAlpha}
+              onChange={(e) => setCleanAlpha(e.target.value)}
+            />
+            <button className="pill" onClick={previewCleanEyes}>Preview</button>
+            <button className="pill" onClick={applyCleanEyes}>Apply</button>
+          </div>
+          <div style={{ marginTop: 8 }}>
+            {cleanPreview ? (
+              <pre style={{ maxHeight: 220, overflow: "auto" }}>
+                {JSON.stringify(cleanPreview, null, 2)}
+              </pre>
+            ) : (
+              <div className="muted">No preview yet.</div>
+            )}
+          </div>
+          <div className="muted">Non-destructive: resets behavior only, not facts/goals.</div>
+        </div>
+
+        {/* History */}
+        <div className="card">
+          <h3>History (recent)</h3>
+          <div style={{ maxHeight: 240, overflow: "auto", border: "1px solid #333", borderRadius: 8, padding: 8 }}>
+            {!history?.length && <div className="muted">(empty)</div>}
+            {history?.slice().reverse().map((h, i) => (
+              <details key={i} style={{ marginBottom: 8 }}>
+                <summary style={{ cursor: "pointer" }}>
+                  <code>{h.ts}</code> — <em>{h.kind}</em>
+                </summary>
+                <pre style={{ margin: 0 }}>{JSON.stringify(h, null, 2)}</pre>
+              </details>
+            ))}
           </div>
         </div>
 

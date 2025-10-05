@@ -11,11 +11,16 @@ from providers import complete_many, reflect_json
 from utils import db
 
 # =====================================================
-#  DoubleHelix API  —  Emergent Reflection Engine
+#  DoubleHelix API  —  Emergent Reflection Engine (v0.9.0)
+#  - Non-destructive Clean Eyes (policy-only reset)
+#  - Reality Bridge (drift/surprise anchoring)
+#  - Illusion Loop (sleep → dream → recall) in tick()
+#  - Goal-aware prompts, forgiving /goals input
+#  - Lightweight history buffer
 # =====================================================
 
 load_dotenv()
-app = FastAPI(title="DoubleHelix API", version="0.8.1")
+app = FastAPI(title="DoubleHelix API", version="0.9.0")
 db.init()
 
 # -----------------------------------------------------
@@ -25,14 +30,14 @@ _origins_env = [o.strip() for o in os.getenv("CORS_ALLOW_ORIGINS", "").split(","
 if not _origins_env:
     _origins_env = [
         "http://localhost:5173",
-        "https://doublehelix-front.onrender.com",   # original
-        "https://doublehelix-frount.onrender.com",  # your deployed UI (typo in hostname)
+        "https://doublehelix-front.onrender.com",
+        "https://doublehelix-frount.onrender.com",  # legacy typo retained for safety
     ]
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_origins_env,
-    allow_origin_regex=r"https://.*\.onrender\.com",
+    allow_origin_regex=os.getenv("CORS_ALLOW_REGEX", r"^https://.*\.onrender\.com$"),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -43,7 +48,7 @@ app.add_middleware(
 # -----------------------------------------------------
 def bootstrap_defaults():
     db.upsert_fact("system.name", "DoubleHelix", 0.95)
-    db.upsert_fact("system.version", "0.8.1", 0.9)
+    db.upsert_fact("system.version", "0.9.0", 0.9)
     db.upsert_fact("last_boot", time.strftime("%Y-%m-%d %H:%M:%S"), 0.7)
 
     if not db.kv_get("meta.births"):
@@ -62,6 +67,11 @@ def bootstrap_defaults():
             "meta_interval": int(os.getenv("META_INTERVAL", "48")),
             "memory_max": int(os.getenv("MEMORY_MAX", "1000")),
             "pattern_threshold": int(os.getenv("PATTERN_THRESHOLD", "3")),
+            # New knobs:
+            "clean_eyes_alpha": float(os.getenv("CLEAN_EYES_ALPHA", "0.5")),  # blend strength
+            "clean_eyes_var": float(os.getenv("CLEAN_EYES_VAR", "0.02")),     # variance trigger
+            "bridge_surprise": float(os.getenv("BRIDGE_SURPRISE", "0.65")),   # surprise trigger
+            "bridge_var": float(os.getenv("BRIDGE_VAR", "0.03")),             # variance trigger
         })
 
     if not db.kv_get("metrics"):
@@ -101,10 +111,32 @@ def _maybe_rate_limit(tokens_estimate: int = 0):
     _token_count += tokens_estimate
 
 # -----------------------------------------------------
+#  History buffer (ring) via KV
+# -----------------------------------------------------
+HIST_KEY = "history.buffer"
+HIST_MAX = int(os.getenv("HISTORY_MAX", "200"))
+
+def _history_get() -> List[Dict[str, Any]]:
+    buf = db.kv_get(HIST_KEY) or {"items": []}
+    items = buf.get("items", [])
+    if not isinstance(items, list):
+        items = []
+    return items
+
+def _history_append(event: Dict[str, Any]):
+    items = _history_get()
+    ts = time.strftime("%Y-%m-%d %H:%M:%S")
+    event = {"ts": ts, **event}
+    items.append(event)
+    if len(items) > HIST_MAX:
+        items = items[-HIST_MAX:]
+    db.kv_upsert(HIST_KEY, {"items": items})
+
+# -----------------------------------------------------
 #  Context + Style
 # -----------------------------------------------------
-def _context_from_memory(prompt: str) -> str:
-    relevant = db.search_facts(prompt, limit=5) or db.top_facts(limit=5)
+def _context_from_memory(prompt: str, k: int = 5) -> str:
+    relevant = db.search_facts(prompt, limit=k) or db.top_facts(limit=k)
     lines = [f"- {r['key']}: {r['value']}" for r in relevant]
     return ("Context facts:\n" + "\n".join(lines) + "\n\n") if lines else ""
 
@@ -168,8 +200,19 @@ def _policy_nudge(vec: Dict[str,float], subs: Dict[str,float], direction: float 
         new_vec[k] = max(-1.0, min(1.0, new_val))
     return new_vec
 
+def _policy_variances(window: int = 10) -> Dict[str, float]:
+    hist = db.get_policy_history(window)
+    variances: Dict[str, float] = {}
+    if len(hist) >= 2:
+        for trait in ("creativity","conciseness","planning_focus","skepticism"):
+            vals = [float(h.get(trait,0.0)) for h in hist if isinstance(h,dict)]
+            if len(vals) >= 2:
+                m = sum(vals)/len(vals)
+                variances[trait] = sum((v-m)**2 for v in vals)/len(vals)
+    return {k: round(v,4) for k,v in variances.items()}
+
 # -----------------------------------------------------
-#  Memory helpers (unchanged)
+#  Memory helpers
 # -----------------------------------------------------
 def memory_decay(decay: float = 0.01):
     items = db.all_facts()
@@ -206,6 +249,7 @@ def memory_consolidate():
             births = int(births_data.get("value", "0")) + 1
             db.upsert_fact(f"emergent:{births}", synthesis["principle"], 0.95)
             db.kv_upsert("meta.births", {"value": str(births)})
+            db.kv_upsert("illusion.last_meta", {"value": synthesis.get("principle")})
 
 def prune_memory(max_items: int = 1000):
     items = db.all_facts()
@@ -213,6 +257,106 @@ def prune_memory(max_items: int = 1000):
         items.sort(key=lambda x: (x.get("confidence", 0.5), x.get("ts", "")))
         for it in items[:len(items)-max_items]:
             db.upsert_fact(it["key"], it["value"], 0.01)
+
+# -----------------------------------------------------
+#  Clean Eyes (non-destructive) + Reality Bridge
+# -----------------------------------------------------
+BASELINE_POLICY_KEY = "cleaneyes.baseline_policy"
+
+def _snapshot_baseline_if_missing():
+    if not db.kv_get(BASELINE_POLICY_KEY):
+        db.kv_upsert(BASELINE_POLICY_KEY, db.get_policy_vector())
+
+_snapshot_baseline_if_missing()
+
+def _soft_blend(curr: Dict[str,float], base: Dict[str,float], alpha: float) -> Dict[str,float]:
+    out = dict(curr)
+    for k in ("creativity","conciseness","planning_focus","skepticism"):
+        out[k] = float(alpha)*float(base.get(k,0.0)) + float(1.0-alpha)*float(curr.get(k,0.0))
+        out[k] = max(-1.0, min(1.0, out[k]))
+    return out
+
+def clean_eyes_preview(alpha: Optional[float] = None) -> Dict[str, Any]:
+    thresholds = db.kv_get("thresholds") or {}
+    alpha = thresholds.get("clean_eyes_alpha", 0.5) if alpha is None else alpha
+    curr = db.get_policy_vector()
+    base = (db.kv_get(BASELINE_POLICY_KEY) or {})
+    proposal = _soft_blend(curr, base, alpha=alpha)
+    return {
+        "alpha": alpha,
+        "current": curr,
+        "baseline": base,
+        "proposal": proposal,
+        "variances": _policy_variances(),
+    }
+
+def clean_eyes_apply(alpha: Optional[float] = None) -> Dict[str, Any]:
+    preview = clean_eyes_preview(alpha)
+    db.set_policy_vector(preview["proposal"])
+    _history_append({"kind": "clean_eyes", "alpha": preview["alpha"], "from": preview["current"], "to": preview["proposal"]})
+    return preview
+
+def _goal_text() -> str:
+    g = db.goal_active()
+    if isinstance(g, dict):
+        return g.get("text", "") or ""
+    return str(g or "")
+
+def _bridge_context(k_goal: int = 1, k_facts: int = 7, k_emergent: int = 2) -> str:
+    goal_text = _goal_text()
+    facts = db.top_facts(limit=20)
+    facts_sorted = sorted(facts, key=lambda x: float(x.get("confidence", 0.5)), reverse=True)
+    picked = facts_sorted[:k_facts]
+    emergent = [f for f in facts_sorted if str(f.get("key","")).startswith("emergent:")][:k_emergent]
+    lines = []
+    if goal_text:
+        lines.append(f"Active goal: {goal_text}")
+    if picked:
+        lines.append("Stable anchors:")
+        for f in picked:
+            lines.append(f"  - {f['key']}: {f['value']}")
+    if emergent:
+        lines.append("Recent emergent principles:")
+        for e in emergent:
+            lines.append(f"  - {e['key']}: {e['value']}")
+    return ("\n".join(lines) + "\n\n") if lines else ""
+
+def _should_bridge() -> bool:
+    thresholds = db.kv_get("thresholds") or {}
+    bridge_s = float(thresholds.get("bridge_surprise", 0.65))
+    bridge_v = float(thresholds.get("bridge_var", 0.03))
+    last_surprise = float((db.kv_get("last.surprise") or {}).get("value", 0.0))
+    variances = _policy_variances()
+    max_var = max(variances.values()) if variances else 0.0
+    return last_surprise >= bridge_s or max_var >= bridge_v
+
+# -----------------------------------------------------
+#  Illusion Loop (sleep → dream → recall) within tick()
+# -----------------------------------------------------
+def illusion_sleep_dream_recall():
+    anchors = _bridge_context(k_goal=1, k_facts=7, k_emergent=2)
+    dream_req = {
+        "phase": "dream",
+        "instruction": "Based on the anchors below, speculate a concise, non-redundant synthesis (1-2 sentences) that could guide future replies.",
+        "anchors": anchors
+    }
+    dream = reflect_json(json.dumps(dream_req))
+    if isinstance(dream, dict) and dream.get("text"):
+        db.kv_upsert("illusion.last_dream", {"value": dream["text"]})
+
+    recall_req = {
+        "phase": "recall",
+        "instruction": "Distill the most concrete, non-obvious, helpful single principle derived from the dream, in plain language.",
+        "dream": dream
+    }
+    recall = reflect_json(json.dumps(recall_req))
+    if isinstance(recall, dict) and recall.get("principle"):
+        births_data = db.kv_get("meta.births") or {"value": "0"}
+        births = int(births_data.get("value","0")) + 1
+        db.upsert_fact(f"emergent:{births}", recall["principle"], 0.95)
+        db.kv_upsert("meta.births", {"value": str(births)})
+        db.kv_upsert("illusion.last_recall", {"value": recall["principle"]})
+        _history_append({"kind": "illusion", "dream": dream, "recall": recall, "birth": births})
 
 # -----------------------------------------------------
 #  Perspectives
@@ -272,8 +416,13 @@ def chat(p: ChatPayload):
 
         vec = db.get_policy_vector()
         style = get_style_prompt(vec)
-        context = _context_from_memory(p.prompt)
         memory = db.top_facts(5)
+
+        # Goal-aware + Reality Bridge context
+        goal_text = _goal_text()
+        goal_prefix = f"Active goal: {goal_text}\n\n" if goal_text else ""
+        bridge = _bridge_context(k_goal=1, k_facts=7, k_emergent=2) if _should_bridge() else ""
+        context = goal_prefix + bridge + _context_from_memory(p.prompt, k=5)
 
         outs = []
         used_profiles = []
@@ -323,6 +472,20 @@ def chat(p: ChatPayload):
         surprise = float(best_subs.get("creativity", 0.0))
         db.kv_upsert("last.surprise", {"value": surprise})
 
+        # history log
+        _history_append({
+            "kind": "chat",
+            "prompt": p.prompt,
+            "active_goal": goal_text,
+            "used_perspectives": p.use_perspectives,
+            "profiles": used_profiles,
+            "candidates": [t for _, t, _ in scored],
+            "chosen": best_text,
+            "score": best_score,
+            "bridge_used": bool(bridge),
+            "surprise": surprise
+        })
+
         return {
             "reply": best_text,
             "meta": {
@@ -332,6 +495,7 @@ def chat(p: ChatPayload):
                 "used_perspectives": bool(p.use_perspectives),
                 "profiles": used_profiles,
                 "policy": vec,
+                "bridge_used": bool(bridge),
             }
         }
 
@@ -350,6 +514,7 @@ def tick():
     meta_interval = int(thresholds.get("meta_interval", 48))
     actions = []
 
+    # Periodic memory maintenance
     if ctr % consolidation_interval == 0:
         memory_decay(0.02)
         prune_memory(int(thresholds.get("memory_max", 1000)))
@@ -359,10 +524,24 @@ def tick():
             db.goals_add(f"Reconcile conflicting facts in '{conflicts[0]['prefix']}'")
             actions.append("conflict_detected")
 
+    # Illusion loop + meta consolidation
     if ctr % meta_interval == 0:
         memory_consolidate()
-        actions.append("meta_reflection")
+        illusion_sleep_dream_recall()
+        actions.append("meta_reflection_and_illusion")
 
+    # Drift-based maintenance
+    variances = _policy_variances()
+    max_var = max(variances.values()) if variances else 0.0
+    if max_var >= float(thresholds.get("clean_eyes_var", 0.02)):
+        clean_eyes_apply(alpha=thresholds.get("clean_eyes_alpha", 0.5))
+        actions.append("clean_eyes_applied")
+
+    if _should_bridge():
+        db.kv_upsert("bridge.last", {"value": _bridge_context(k_goal=1, k_facts=7, k_emergent=2)})
+        actions.append("bridge_refreshed")
+
+    _history_append({"kind": "tick", "n": ctr, "actions": actions, "variances": variances})
     return {"ok": True, "tick": ctr, "actions": actions}
 
 # -----------------------------------------------------
@@ -384,6 +563,7 @@ def feedback(p: FeedbackPayload):
     else:
         vec["conciseness"] = min(1.0, vec.get("conciseness",0) + 0.05)
     db.set_policy_vector(vec)
+    _history_append({"kind": "feedback", "signal": p.signal, "reward.total": total, "policy": vec})
     return {"ok": True, "reward.total": total, "policy": vec}
 
 @app.get("/emergence")
@@ -402,6 +582,10 @@ def emergence_status():
                 variances[trait] = round(var,4)
 
     last_surprise = (db.kv_get("last.surprise") or {}).get("value", 0.0)
+    illusion = {
+        "dream": (db.kv_get("illusion.last_dream") or {}).get("value"),
+        "recall": (db.kv_get("illusion.last_recall") or {}).get("value"),
+    }
 
     return {
         "emergent_principles": births,
@@ -410,6 +594,7 @@ def emergence_status():
         "total_interactions": metrics.get("total_replies", 0),
         "current_policy": db.get_policy_vector(),
         "surprise": last_surprise,
+        "illusion": illusion,
     }
 
 # -----------------------------------------------------
@@ -435,7 +620,26 @@ def api_policy_history(limit: int = 20):
     return {"history": db.get_policy_history(last=limit)}
 
 # -----------------------------------------------------
-#  Goals (robust: accepts JSON body OR query/form OR raw text)
+#  Clean Eyes endpoints
+# -----------------------------------------------------
+@app.get("/clean/preview")
+def api_clean_preview(alpha: Optional[float] = None):
+    return clean_eyes_preview(alpha)
+
+@app.post("/clean/apply")
+def api_clean_apply(alpha: Optional[float] = None):
+    return clean_eyes_apply(alpha)
+
+# -----------------------------------------------------
+#  History endpoint
+# -----------------------------------------------------
+@app.get("/history")
+def api_history(limit: int = 50):
+    items = _history_get()
+    return {"history": items[-limit:] if limit and limit > 0 else items}
+
+# -----------------------------------------------------
+#  Goals (robust parsing)
 # -----------------------------------------------------
 class GoalIn(BaseModel):
     text: str
@@ -452,18 +656,29 @@ async def api_goals_add(
 ):
     text: Optional[str] = None
 
-    # 1) JSON body {"text": "..."}
+    # 1) JSON pydantic
     if payload and getattr(payload, "text", None):
         text = payload.text
 
-    # 2) ?text=... query support
+    # 1b) raw JSON (any common key)
+    if not text:
+        try:
+            js = await request.json()
+            if isinstance(js, dict):
+                for k in ("text","goal","value","message"):
+                    if k in js and str(js[k]).strip():
+                        text = str(js[k]).strip()
+                        break
+        except Exception:
+            pass
+
+    # 2) ?text=...
     if not text and text_qs:
         text = text_qs
 
-    # 3) raw or form text fallback
+    # 3) raw body (text/plain)
     if not text:
         try:
-            # try raw body (e.g., text/plain)
             raw = await request.body()
             raw = raw.decode("utf-8").strip()
             if raw and raw != "{}":
@@ -471,12 +686,14 @@ async def api_goals_add(
         except Exception:
             pass
 
+    # 4) form data fallbacks
     if not text:
-        # last chance: form data
         try:
             form = await request.form()
-            if "text" in form and str(form["text"]).strip():
-                text = str(form["text"]).strip()
+            for k in ("text","goal","value","message"):
+                if k in form and str(form[k]).strip():
+                    text = str(form[k]).strip()
+                    break
         except Exception:
             pass
 
@@ -484,11 +701,13 @@ async def api_goals_add(
         raise HTTPException(400, "Missing goal text")
 
     gid = db.goals_add(text.strip())
+    _history_append({"kind":"goal_add","id":gid,"text":text.strip()})
     return {"status": "ok", "id": gid, "goals": db.goals_list()}
 
 @app.post("/goals/{goal_id}/activate")
 def api_goals_activate(goal_id: int):
     db.goals_activate(goal_id)
+    _history_append({"kind":"goal_activate","id":goal_id,"active":db.goal_active()})
     return {"status": "ok", "active": goal_id}
 
 @app.get("/goals/active")

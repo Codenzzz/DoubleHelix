@@ -122,3 +122,85 @@ details > summary::-webkit-details-marker { display: none; }
 .error { color: #fca5a5; font-size: 12px; }
 .muted { opacity: .65; }
 kbd { font-family: ui-monospace, Menlo, Consolas, monospace; }
+/* =========================
+   Micro enhancements
+   ========================= */
+
+/* Focus visibility (keyboard users) */
+:focus-visible {
+  outline: 2px solid #60a5fa;
+  outline-offset: 2px;
+}
+
+/* Button variants */
+button.secondary {
+  background: #0e1116;
+  color: #e5e7eb;
+}
+button.danger {
+  background: #b91c1c;
+}
+
+/* Pill variants + subtle hover */
+.pill.success { background: #0f2a1d; border-color: rgba(16,185,129,.35); color: #86efac; }
+.pill.warn    { background: #2a1f10; border-color: rgba(234,179,8,.35); color: #fde68a; }
+.pill.info    { background: #101b2a; border-color: rgba(59,130,246,.35); color: #93c5fd; }
+.pill:hover   { filter: brightness(1.06); }
+
+/* Inputs: focus ring */
+textarea:focus, input:focus, select:focus {
+  border-color: #2563eb;
+  box-shadow: 0 0 0 3px rgba(37,99,235,.25);
+  outline: none;
+}
+
+/* Scrollbars (WebKit) */
+*::-webkit-scrollbar        { height: 10px; width: 10px; }
+*::-webkit-scrollbar-track  { background: #0e1116; }
+*::-webkit-scrollbar-thumb  { background: #1f2937; border-radius: 8px; }
+*::-webkit-scrollbar-thumb:hover { background: #374151; }
+
+/* Cards: subtle lift on hover */
+.card { transition: transform .12s ease, box-shadow .12s ease; }
+.card:hover { transform: translateY(-1px); box-shadow: 0 12px 36px rgba(0,0,0,.38); }
+
+/* Details <summary>: add chevron */
+details > summary::before {
+  content: "▸";
+  display: inline-block;
+  margin-right: 6px;
+  transition: transform .15s;
+  opacity: .8;
+}
+details[open] > summary::before { transform: rotate(90deg); }
+
+/* Code blocks: monospace + small size tweak */
+pre, code, kbd, samp { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace; }
+pre { font-size: 12.5px; line-height: 1.45; }
+
+/* Chat bubbles (reuse your classes) */
+.chat-bubble { transition: border-color .12s ease, background .12s ease; }
+.chat-bubble.user { background: #171a20; }
+
+/* Simple progress bar (for policy stability visual if you add one) */
+.progress {
+  height: 8px; border-radius: 999px; background: #11151b; overflow: hidden; border: 1px solid rgba(255,255,255,.08);
+}
+.progress > span {
+  display: block; height: 100%; background: linear-gradient(90deg, #2563eb, #60a5fa);
+  width: var(--value, 0%); transition: width .25s ease;
+}
+
+/* Utility grid for small stats */
+.stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
+@media (max-width: 700px) { .stats { grid-template-columns: 1fr 1fr; } }
+.stat {
+  background: #0e1116; border: 1px solid rgba(255,255,255,.08); border-radius: 12px; padding: 10px;
+}
+.stat .label { font-size: 12px; opacity: .7; }
+.stat .value { font-weight: 700; }
+
+/* Reduce motion for sensitive users */
+@media (prefers-reduced-motion: reduce) {
+  * { transition: none !important; animation: none !important; }
+}
