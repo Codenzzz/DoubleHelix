@@ -1,6 +1,5 @@
-
 import os, time, json, re, itertools
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Response
 from pydantic import BaseModel
 from typing import List, Dict, Any, Tuple
 from dotenv import load_dotenv
@@ -81,6 +80,11 @@ def _style_hint(vec: Dict[str, float]) -> str:
     prefs.append('If memory helps, respond with {"tool":"memory_search","tool_input":"query"}.')
     return "Style preferences: " + "; ".join(prefs) + "."
 
+# --- health checks for Render ---
+@app.get("/health")
+@app.get("/healthz")
+def health(_: Response):
+    return {"status": "ok"}
 # --- scoring + policy ---
 def _subscores(text: str, memory_text: str) -> Dict[str, float]:
     def bag(s): return set(w.lower() for w in re.findall(r"[a-zA-Z]+", s))
