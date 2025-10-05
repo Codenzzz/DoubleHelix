@@ -184,4 +184,10 @@ export default function App() {
           <h3>Emergence</h3>
           <pre>{emergence ? JSON.stringify(emergence, null, 2) : "(no data yet)"}</pre>
           <div className="muted">
-            This aggregates meta signals like emer
+            This aggregates meta signals like emergent principles, policy stability, and scores.
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
