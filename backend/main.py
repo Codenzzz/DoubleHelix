@@ -15,14 +15,25 @@ load_dotenv()
 app = FastAPI(title="DoubleHelix API", version="0.8.1")
 db.init()
 
-# CORS (controlled by env var CORS_ALLOW_ORIGINS, comma-separated)
-origins = os.getenv("CORS_ALLOW_ORIGINS", "*").split(",")
+# -----------------------------
+# CORS (env-driven + *.onrender.com fallback)
+# -----------------------------
+_origins_env = [o.strip() for o in os.getenv("CORS_ALLOW_ORIGINS", "").split(",") if o.strip()]
+if not _origins_env:
+    _origins_env = [
+        "https://doublehelix-frount.onrender.com",
+        "https://doublehelix-front.onrender.com",
+        "http://localhost:5173",
+    ]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[o.strip() for o in origins if o.strip()],
+    allow_origins=_origins_env,
+    allow_origin_regex=r"https://.*\.onrender\.com",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["*"],
 )
 
 # -----------------------------
@@ -210,7 +221,6 @@ def prune_memory(max_items: int = 1000):
 def detect_surprise(best_text: str, vec: Dict[str, float], prompt: str) -> float:
     expected_length = 300 if vec.get("conciseness", 0) > 0 else 600
     length_surprise = abs(len(best_text) - expected_length) / 600.0
-    # novelty proxy
     words = best_text.split()
     uniq = len(set(w.lower() for w in words))
     actual_novelty = uniq / (len(words)+1e-6)
@@ -302,6 +312,20 @@ def _run_tool(obj: Dict[str, Any]) -> str:
     return f"unknown_tool: {tool}"
 
 # -----------------------------
+# Provider-safe helpers for chat
+# -----------------------------
+def _simulate_candidates(context_plus_prompt: str, style: str, n: int) -> List[Dict[str, Any]]:
+    return [{"content": f"[DRY_RUN] {style} → {context_plus_prompt[:240]}"} for _ in range(max(1, n))]
+
+def _complete_candidates(context_plus_prompt: str, n: int, model: str, style_hint: str) -> List[Dict[str, Any]]:
+    if DRY_RUN:
+        return _simulate_candidates(context_plus_prompt, "(simulated)", n)
+    try:
+        return complete_many(context_plus_prompt, n=n, model=model, style_hint=style_hint)
+    except Exception as e:
+        return [{"content": f"[provider_error] {type(e).__name__}: {e}"}]
+
+# -----------------------------
 # API routes
 # -----------------------------
 @app.get("/policy")
@@ -337,90 +361,116 @@ class ChatPayload(BaseModel):
 
 @app.post("/chat")
 def chat(p: ChatPayload):
-    _maybe_rate_limit(max(50, len(p.prompt)//3))
-    vec = db.get_policy_vector()
-    style = get_style_prompt(vec)
-    context = _context_from_memory(p.prompt)
-    memory = db.top_facts(5)
+    try:
+        _maybe_rate_limit(max(50, len(p.prompt)//3))
 
-    outs: List[Dict[str, Any]] = []
-    if p.use_perspectives:
-        for profile in ["base", "explorer", "skeptic", "planner"]:
-            p_vec = perturb_policy(vec, profile) if profile != "base" else vec
-            p_style = get_style_prompt(p_vec)
-            outs.extend(
-                complete_many(context + p.prompt, n=1, model=p.model or "gpt-4o-mini", style_hint=p_style)
-            )
-    else:
-        outs = complete_many(context + p.prompt, n=N_SAMPLES, model=p.model or "gpt-4o-mini", style_hint=style)
+        vec = db.get_policy_vector()
+        style = get_style_prompt(vec)
+        context = _context_from_memory(p.prompt)
+        memory = db.top_facts(5)
 
-    processed = []
-    for o in outs:
-        text = o.get("content","")
-        is_tool, obj = _maybe_tool_call(text)
-        if is_tool:
-            text = f"(Tool {obj['tool']} -> {_run_tool(obj)})"
-        processed.append(text)
+        outs: List[Dict[str, Any]] = []
+        if p.use_perspectives:
+            for profile in ["base", "explorer", "skeptic", "planner"]:
+                p_vec = perturb_policy(vec, profile) if profile != "base" else vec
+                p_style = get_style_prompt(p_vec)
+                outs.extend(
+                    _complete_candidates(context + p.prompt, n=1, model=p.model or "gpt-4o-mini", style_hint=p_style)
+                )
+        else:
+            outs = _complete_candidates(context + p.prompt, n=N_SAMPLES, model=p.model or "gpt-4o-mini", style_hint=style)
 
-    scored = [(_score_with_policy(t, memory, vec)[0], t, _score_with_policy(t, memory, vec)[1]) for t in processed]
-    scored.sort(key=lambda x: x[0], reverse=True)
-    best_score, best_text, best_subs = scored[0]
+        processed = []
+        for o in outs:
+            text = o.get("content","")
+            is_tool, obj = _maybe_tool_call(text)
+            if is_tool:
+                text = f"(Tool {obj['tool']} -> {_run_tool(obj)})"
+            processed.append(text)
 
-    surprise = detect_surprise(best_text, vec, p.prompt)
-    thresholds = db.kv_get("thresholds") or {}
-    if surprise > float(thresholds.get("surprise", 0.6)):
-        db.goals_add(f"Investigate surprising reply: '{p.prompt[:60]}...' (surprise={surprise:.2f})")
+        if not processed:
+            processed = ["[no_output]"]
 
-    reflection_prompt = json.dumps({
-        "role":"self-reflect",
-        "user_prompt": p.prompt,
-        "candidates":[{"score":s,"text":t} for s,t,_ in scored],
-        "policy_vector": vec,
-        "surprise_level": surprise,
-        "instructions":[
-            "Return JSON: best_candidate_index, new_fact, policy_adjustment (trait deltas), prompt_proposal, confidence.",
-            "Suggest small deltas (-0.2..+0.2) for traits if useful.",
-            "If style prompt could improve, suggest prompt_proposal with confidence."
-        ]
-    })
-    reflect = reflect_json(reflection_prompt)
-    db.upsert_fact("reflect.last", json.dumps(reflect), 0.7)
-    if isinstance(reflect, dict) and reflect.get("new_fact"):
-        db.upsert_fact(f"principle:auto:{int(time.time())}", reflect["new_fact"], 0.85)
+        scored = []
+        for t in processed:
+            s, subs = _score_with_policy(t, memory, vec)
+            scored.append((s, t, subs))
+        scored.sort(key=lambda x: x[0], reverse=True)
 
-    if isinstance(reflect, dict) and reflect.get("prompt_proposal") and reflect.get("confidence") is not None:
+        best_score, best_text, best_subs = scored[0]
+
+        surprise = 0.0
         try:
-            evolve_prompt(reflect["prompt_proposal"], float(reflect.get("confidence", 0)))
-        except:
+            surprise = detect_surprise(best_text, vec, p.prompt)
+            thresholds = db.kv_get("thresholds") or {}
+            if surprise > float(thresholds.get("surprise", 0.6)):
+                db.goals_add(f"Investigate surprising reply: '{p.prompt[:60]}...' (surprise={surprise:.2f})")
+        except Exception:
             pass
 
-    vec = _policy_nudge(vec, best_subs, 0.06)
-    if isinstance(reflect, dict) and isinstance(reflect.get("policy_adjustment"), dict):
-        for k, delta in reflect["policy_adjustment"].items():
-            try:
-                vec[k] = max(-1.0, min(1.0, vec.get(k,0.0) + float(delta)))
-            except:
-                pass
-    db.set_policy_vector(vec)
+        reflect = None
+        try:
+            reflection_prompt = json.dumps({
+                "role":"self-reflect",
+                "user_prompt": p.prompt,
+                "candidates":[{"score":s,"text":t} for s,t,_ in scored],
+                "policy_vector": vec,
+                "surprise_level": surprise,
+                "instructions":[
+                    "Return JSON: best_candidate_index, new_fact, policy_adjustment (trait deltas), prompt_proposal, confidence.",
+                    "Suggest small deltas (-0.2..+0.2) for traits if useful.",
+                    "If style prompt could improve, suggest prompt_proposal with confidence."
+                ]
+            })
+            reflect = reflect_json(reflection_prompt)
+            db.upsert_fact("reflect.last", json.dumps(reflect), 0.7)
+            if isinstance(reflect, dict) and reflect.get("new_fact"):
+                db.upsert_fact(f"principle:auto:{int(time.time())}", reflect["new_fact"], 0.85)
+            if isinstance(reflect, dict) and reflect.get("prompt_proposal") and reflect.get("confidence") is not None:
+                try:
+                    evolve_prompt(reflect["prompt_proposal"], float(reflect.get("confidence", 0)))
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
-    metrics = db.kv_get("metrics") or {}
-    metrics["total_replies"] = metrics.get("total_replies", 0) + 1
-    old_avg = metrics.get("avg_reply_score", 0.0)
-    total = metrics["total_replies"]
-    metrics["avg_reply_score"] = (old_avg * (total-1) + best_score) / max(1, total)
-    db.kv_upsert("metrics", metrics)
+        try:
+            vec = _policy_nudge(vec, best_subs, 0.06)
+            if isinstance(reflect, dict) and isinstance(reflect.get("policy_adjustment"), dict):
+                for k, delta in reflect["policy_adjustment"].items():
+                    try:
+                        vec[k] = max(-1.0, min(1.0, vec.get(k,0.0) + float(delta)))
+                    except Exception:
+                        pass
+            db.set_policy_vector(vec)
+        except Exception:
+            pass
 
-    return {
-        "reply": best_text,
-        "meta": {
-            "score": best_score,
-            "candidates": len(scored),
-            "policy": vec,
-            "reflection": bool(reflect),
-            "surprise": round(surprise, 3),
-            "perspectives_used": p.use_perspectives
+        try:
+            metrics = db.kv_get("metrics") or {}
+            metrics["total_replies"] = metrics.get("total_replies", 0) + 1
+            old_avg = metrics.get("avg_reply_score", 0.0)
+            total = metrics["total_replies"]
+            metrics["avg_reply_score"] = (old_avg * (total-1) + best_score) / max(1, total)
+            db.kv_upsert("metrics", metrics)
+        except Exception:
+            pass
+
+        return {
+            "reply": best_text,
+            "meta": {
+                "score": best_score,
+                "candidates": len(scored),
+                "policy": vec,
+                "reflection": bool(reflect),
+                "surprise": round(surprise, 3),
+                "perspectives_used": p.use_perspectives
+            }
         }
-    }
+
+    except Exception as e:
+        # Never 500 to the browser; keeps CORS behavior clean
+        return {"reply": f"[server_error] {type(e).__name__}: {e}", "meta": {"error": True}}
 
 class FeedbackPayload(BaseModel):
     signal: str
@@ -548,11 +598,11 @@ def emergence_status():
 # -----------------------------
 # Auto-tick background loop (env-driven)
 # -----------------------------
-import threading, time, os
+import threading, time as _t_time, os as _t_os  # avoid shadowing above names
 
 _AUTO_TICK_STARTED = False  # guard against double starts (e.g., reloads)
-AUTO_TICK_ENABLED = os.getenv("AUTO_TICK", "true").lower() == "true"
-AUTO_TICK_INTERVAL = int(os.getenv("AUTO_TICK_INTERVAL", "300"))  # seconds (default 5 min)
+AUTO_TICK_ENABLED = _t_os.getenv("AUTO_TICK", "true").lower() == "true"
+AUTO_TICK_INTERVAL = int(_t_os.getenv("AUTO_TICK_INTERVAL", "300"))  # seconds (default 5 min)
 
 def auto_tick(interval=AUTO_TICK_INTERVAL):
     while True:
@@ -562,7 +612,7 @@ def auto_tick(interval=AUTO_TICK_INTERVAL):
             print("[AutoTick] Done.\n")
         except Exception as e:
             print("[AutoTick ERROR]", e)
-        time.sleep(interval)
+        _t_time.sleep(interval)
 
 # Start once per process
 if AUTO_TICK_ENABLED and not _AUTO_TICK_STARTED:
