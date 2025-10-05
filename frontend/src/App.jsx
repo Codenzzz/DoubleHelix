@@ -1,6 +1,6 @@
 import React, { useEffect, useMemo, useState } from "react";
 
-/** API base resolution */
+/** ------------ API base resolution ------------ */
 const resolvedApiBase =
   (typeof import.meta !== "undefined" &&
     import.meta.env &&
@@ -24,7 +24,7 @@ async function getJSON(path, opts) {
   return res.json();
 }
 
-// NEW: generic JSON POST
+// Generic JSON POST
 async function postJSON(path, body, opts = {}) {
   const res = await fetch(apiURL(path), {
     method: "POST",
@@ -39,6 +39,7 @@ async function postJSON(path, body, opts = {}) {
   return res.json();
 }
 
+/** ------------ App ------------ */
 export default function App() {
   const API_BASE = useMemo(() => resolvedApiBase, []);
   const [health, setHealth] = useState("checking...");
@@ -54,7 +55,7 @@ export default function App() {
   const [emergence, setEmergence] = useState(null);
   const [error, setError] = useState(null);
 
-  // NEW: chat state
+  // Chat state
   const [chatInput, setChatInput] = useState("");
   const [chatSending, setChatSending] = useState(false);
   const [messages, setMessages] = useState([]); // [{role:'user'|'assistant', text, meta?}]
@@ -129,7 +130,7 @@ export default function App() {
     }
   }
 
-  // NEW: chat handlers
+  // Chat handlers
   async function sendChat(e) {
     e?.preventDefault?.();
     const prompt = chatInput.trim();
@@ -147,7 +148,7 @@ export default function App() {
       });
       setMessages((m) => [
         ...m,
-        { role: "assistant", text: resp.reply, meta: resp.meta },
+        { role: "assistant", text: resp.reply ?? "(no reply)", meta: resp.meta },
       ]);
     } catch (err) {
       setMessages((m) => [...m, { role: "assistant", text: `⚠️ ${String(err)}` }]);
@@ -170,13 +171,14 @@ export default function App() {
       </div>
 
       {/* Debug row */}
-      <div className="row" style={{ marginBottom: 8 }}>
+      <div className="row" style={{ marginBottom: 8, gap: 8, flexWrap: "wrap" }}>
         <span className="pill">API: {API_BASE}</span>
         <span className="pill">health: {health}</span>
         {error && <span className="pill" style={{ background: "#522" }}>err</span>}
         <button className="pill" onClick={refresh}>Refresh</button>
         <button className="pill" onClick={tick}>Planner Tick</button>
       </div>
+
       {error && (
         <div className="card" style={{ borderColor: "#a44" }}>
           <strong>Error</strong>
@@ -204,19 +206,20 @@ export default function App() {
         {/* Goals */}
         <div className="card">
           <h3>Goals</h3>
-          <div className="row">
+          <div className="row" style={{ gap: 8 }}>
             <input
               placeholder="New goal…"
               value={newGoal}
               onChange={(e) => setNewGoal(e.target.value)}
+              style={{ flex: 1 }}
             />
             <button onClick={addGoal}>Add</button>
           </div>
           <div style={{ marginTop: 10 }}>
             {goals.map((g) => (
-              <div key={g.id} className="row" style={{ marginBottom: 6 }}>
+              <div key={g.id} className="row" style={{ marginBottom: 6, gap: 8 }}>
                 <span className="pill">#{g.id}</span>
-                <span>{g.text}</span>
+                <span style={{ flex: 1 }}>{g.text}</span>
                 <span className="pill">active: {String(g.active)}</span>
                 {!g.active && (
                   <button className="ghost" onClick={() => activateGoal(g.id)}>
@@ -238,12 +241,12 @@ export default function App() {
           </div>
         </div>
 
-        {/* NEW: Chat */}
+        {/* Chat */}
         <div className="card">
           <h3>Chat</h3>
 
           {/* Controls */}
-          <div className="row" style={{ gap: 8, marginBottom: 8 }}>
+          <div className="row" style={{ gap: 8, marginBottom: 8, flexWrap: "wrap" }}>
             <label className="pill" style={{ cursor: "pointer" }}>
               <input
                 type="checkbox"
@@ -263,7 +266,6 @@ export default function App() {
               <option value="">default (backend)</option>
               <option value="gpt-4o-mini">gpt-4o-mini</option>
               <option value="gpt-4o">gpt-4o</option>
-              {/* add others you support */}
             </select>
           </div>
 
@@ -313,11 +315,7 @@ export default function App() {
               placeholder="Type a message… (Enter to send)"
               value={chatInput}
               onChange={(e) => setChatInput(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === "Enter" && !e.shiftKey) {
-                  sendChat(e);
-                }
-              }}
+              onKeyDown={onChatKeyDown}
               disabled={chatSending}
               style={{ flex: 1 }}
             />
