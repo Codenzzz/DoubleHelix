@@ -1,9 +1,9 @@
 import React, { useEffect, useMemo, useState } from "react";
 
-/** Decide API base:
- * 1) Use VITE_API_BASE when injected by Vite (Render)
- * 2) Else if running on localhost, use the local FastAPI port
- * 3) Else safe production fallback
+/** API base resolution:
+ *  - Use VITE_API_BASE in Render builds
+ *  - Use localhost:8000 during local dev
+ *  - Else fallback to the live backend
  */
 const resolvedApiBase =
   (typeof import.meta !== "undefined" &&
@@ -14,21 +14,9 @@ const resolvedApiBase =
     ? "http://localhost:8000"
     : "https://doublehelix.onrender.com");
 
-// Safer URL builder (avoids double/missing slashes)
+// Build absolute URL safely (no double/missing slashes)
 function apiURL(path) {
-  return new URL(path.replace(/^\/*/, "/"), resolvedApiBase).toString();
-}
-
-async function getJSON(path, opts) {
-  const res = await fetch(apiURL(path), opts);
-  if (!res.ok) {
-    const txt = await res.text().catch(() => "");
-    throw new Error(`GET ${path} → ${res.status} ${res.statusText} ${txt}`);
-  }
-  return res.json();
-}
-function apiURL(path) {
-  return new URL(path.replace(/^\/*/, "/"), resolvedApiBase).toString();
+  return new URL(String(path).replace(/^\/*/, "/"), resolvedApiBase).toString();
 }
 
 async function getJSON(path, opts) {
@@ -80,8 +68,8 @@ export default function App() {
     }
 
     try {
-      const e = await getJSON("/emergence");
-      setEmergence(e);
+      const em = await getJSON("/emergence");
+      setEmergence(em);
     } catch (e) {
       setError((prev) => prev || String(e));
     }
@@ -134,7 +122,7 @@ export default function App() {
         Emergence: consolidation • curiosity • multi-scale • prompt evolution • perspectives
       </div>
 
-      {/* Tiny status row for quick debugging */}
+      {/* Debug row */}
       <div className="row" style={{ marginBottom: 8 }}>
         <span className="pill">API: {API_BASE}</span>
         <span className="pill">health: {health}</span>
@@ -196,10 +184,4 @@ export default function App() {
           <h3>Emergence</h3>
           <pre>{emergence ? JSON.stringify(emergence, null, 2) : "(no data yet)"}</pre>
           <div className="muted">
-            This aggregates meta signals like emergent principles, policy stability, and scores.
-          </div>
-        </div>
-      </div>
-    </div>
-  );
-}
+            This aggregates meta signals like emer
