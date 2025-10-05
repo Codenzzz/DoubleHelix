@@ -1,9 +1,10 @@
-import os, time, json, re, itertools, threading
-from fastapi import FastAPI, HTTPException
+import os, time, json, re, threading
+from typing import List, Dict, Any, Optional, Tuple
+
+from fastapi import FastAPI, HTTPException, Body, Request, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
-from typing import List, Dict, Any, Tuple, Optional
 from dotenv import load_dotenv
 
 from providers import complete_many, reflect_json
@@ -24,7 +25,8 @@ _origins_env = [o.strip() for o in os.getenv("CORS_ALLOW_ORIGINS", "").split(","
 if not _origins_env:
     _origins_env = [
         "http://localhost:5173",
-        "https://doublehelix-front.onrender.com",
+        "https://doublehelix-front.onrender.com",   # original
+        "https://doublehelix-frount.onrender.com",  # your deployed UI (typo in hostname)
     ]
 
 app.add_middleware(
@@ -104,7 +106,7 @@ def _maybe_rate_limit(tokens_estimate: int = 0):
 def _context_from_memory(prompt: str) -> str:
     relevant = db.search_facts(prompt, limit=5) or db.top_facts(limit=5)
     lines = [f"- {r['key']}: {r['value']}" for r in relevant]
-    return "Context facts:\n" + "\n".join(lines) + "\n\n" if lines else ""
+    return ("Context facts:\n" + "\n".join(lines) + "\n\n") if lines else ""
 
 def get_style_prompt(vec: Dict[str, float]) -> str:
     evolved = db.kv_get("prompts.style_hint")
@@ -125,7 +127,7 @@ def _style_hint(vec: Dict[str, float]) -> str:
     return "Style preferences: " + "; ".join(prefs) + "."
 
 # -----------------------------------------------------
-#  Health Check
+#  Health
 # -----------------------------------------------------
 @app.get("/")
 @app.get("/health")
@@ -144,9 +146,9 @@ def _subscores(text: str, memory_text: str) -> Dict[str, float]:
     conciseness = max(0.0, 1.0 - (length/600.0))
     planning = 1.0 if re.search(r"\b(1\.|-|\*)", text) or ("\n" in text and len(text.splitlines())>=3) else 0.0
     skepticism = min(1.0, len(re.findall(r"\b(might|may|could|uncertain|not sure)\b", text.lower()))/3.0)
-    return {"creativity":novelty,"conciseness":conciseness,"planning_focus":planning,"skepticism":skepticism}
+    return {"creativity": novelty, "conciseness": conciseness, "planning_focus": planning, "skepticism": skepticism}
 
-def _score_with_policy(text: str, memory: List[Dict[str,Any]], vec: Dict[str,float]) -> tuple[float,Dict[str,float]]:
+def _score_with_policy(text: str, memory: List[Dict[str,Any]], vec: Dict[str,float]) -> Tuple[float,Dict[str,float]]:
     mem_text = " ".join([m["value"] for m in memory])
     subs = _subscores(text, mem_text)
     score = sum((1.0 + float(vec.get(k,0.0))) * v for k,v in subs.items())
@@ -167,7 +169,7 @@ def _policy_nudge(vec: Dict[str,float], subs: Dict[str,float], direction: float 
     return new_vec
 
 # -----------------------------------------------------
-#  Memory
+#  Memory helpers (unchanged)
 # -----------------------------------------------------
 def memory_decay(decay: float = 0.01):
     items = db.all_facts()
@@ -213,7 +215,7 @@ def prune_memory(max_items: int = 1000):
             db.upsert_fact(it["key"], it["value"], 0.01)
 
 # -----------------------------------------------------
-#  Multi-agent perspectives
+#  Perspectives
 # -----------------------------------------------------
 def perturb_policy(vec: Dict[str, float], profile: str) -> Dict[str, float]:
     p = dict(vec)
@@ -256,7 +258,7 @@ def _run_tool(obj: Dict[str, Any]) -> str:
     return f"unknown_tool: {tool}"
 
 # -----------------------------------------------------
-#  Chat Route
+#  Chat
 # -----------------------------------------------------
 class ChatPayload(BaseModel):
     prompt: str
@@ -274,13 +276,16 @@ def chat(p: ChatPayload):
         memory = db.top_facts(5)
 
         outs = []
+        used_profiles = []
         if p.use_perspectives:
             for profile in ["base", "explorer", "skeptic", "planner"]:
                 p_vec = perturb_policy(vec, profile) if profile != "base" else vec
                 p_style = get_style_prompt(p_vec)
                 outs.extend(complete_many(context + p.prompt, n=1, model=p.model or "gpt-4o-mini", style_hint=p_style))
+                used_profiles.append(profile)
         else:
             outs = complete_many(context + p.prompt, n=N_SAMPLES, model=p.model or "gpt-4o-mini", style_hint=style)
+            used_profiles.append("base")
 
         processed = []
         for o in outs:
@@ -301,19 +306,40 @@ def chat(p: ChatPayload):
 
         best_score, best_text, best_subs = scored[0]
 
+        # policy nudge & persist
         vec = _policy_nudge(vec, best_subs, 0.06)
         db.set_policy_vector(vec)
 
+        # metrics + surprise tracking
+        metrics = db.kv_get("metrics") or {}
+        prev_total = int(metrics.get("total_replies", 0))
+        new_total  = prev_total + 1
+        prev_avg   = float(metrics.get("avg_reply_score", 0.0))
+        metrics["total_replies"]  = new_total
+        metrics["avg_reply_score"] = round((prev_avg * prev_total + best_score) / new_total, 3)
+        db.kv_upsert("metrics", metrics)
+
+        # Surprise proxy = novelty/creativity subscore
+        surprise = float(best_subs.get("creativity", 0.0))
+        db.kv_upsert("last.surprise", {"value": surprise})
+
         return {
             "reply": best_text,
-            "meta": {"score": best_score, "candidates": len(scored), "policy": vec}
+            "meta": {
+                "score": best_score,
+                "surprise": round(surprise, 3),
+                "candidates": len(scored),
+                "used_perspectives": bool(p.use_perspectives),
+                "profiles": used_profiles,
+                "policy": vec,
+            }
         }
 
     except Exception as e:
         return {"reply": f"[server_error] {type(e).__name__}: {e}", "meta": {"error": True}}
 
 # -----------------------------------------------------
-#  Planner / Tick Loop
+#  Planner / Tick
 # -----------------------------------------------------
 @app.post("/tick")
 def tick():
@@ -340,7 +366,7 @@ def tick():
     return {"ok": True, "tick": ctr, "actions": actions}
 
 # -----------------------------------------------------
-#  Feedback / Meta / Emergence
+#  Feedback / Emergence
 # -----------------------------------------------------
 class FeedbackPayload(BaseModel):
     signal: str
@@ -374,16 +400,20 @@ def emergence_status():
                 mean = sum(vals)/len(vals)
                 var = sum((v - mean)**2 for v in vals)/len(vals)
                 variances[trait] = round(var,4)
+
+    last_surprise = (db.kv_get("last.surprise") or {}).get("value", 0.0)
+
     return {
         "emergent_principles": births,
         "policy_stability": variances,
         "avg_reply_score": metrics.get("avg_reply_score", 0),
         "total_interactions": metrics.get("total_replies", 0),
         "current_policy": db.get_policy_vector(),
+        "surprise": last_surprise,
     }
 
 # -----------------------------------------------------
-#  Policy Endpoints
+#  Policy
 # -----------------------------------------------------
 class PolicyVector(BaseModel):
     creativity: float = 0.0
@@ -405,7 +435,7 @@ def api_policy_history(limit: int = 20):
     return {"history": db.get_policy_history(last=limit)}
 
 # -----------------------------------------------------
-#  Goals Endpoints
+#  Goals (robust: accepts JSON body OR query/form OR raw text)
 # -----------------------------------------------------
 class GoalIn(BaseModel):
     text: str
@@ -415,9 +445,46 @@ def api_goals_list():
     return {"goals": db.goals_list()}
 
 @app.post("/goals")
-def api_goals_add(payload: GoalIn):
-    gid = db.goals_add(payload.text)
-    return {"status": "ok", "id": gid}
+async def api_goals_add(
+    request: Request,
+    payload: Optional[GoalIn] = Body(None),
+    text_qs: Optional[str] = Query(None, alias="text"),
+):
+    text: Optional[str] = None
+
+    # 1) JSON body {"text": "..."}
+    if payload and getattr(payload, "text", None):
+        text = payload.text
+
+    # 2) ?text=... query support
+    if not text and text_qs:
+        text = text_qs
+
+    # 3) raw or form text fallback
+    if not text:
+        try:
+            # try raw body (e.g., text/plain)
+            raw = await request.body()
+            raw = raw.decode("utf-8").strip()
+            if raw and raw != "{}":
+                text = raw
+        except Exception:
+            pass
+
+    if not text:
+        # last chance: form data
+        try:
+            form = await request.form()
+            if "text" in form and str(form["text"]).strip():
+                text = str(form["text"]).strip()
+        except Exception:
+            pass
+
+    if not text or not text.strip():
+        raise HTTPException(400, "Missing goal text")
+
+    gid = db.goals_add(text.strip())
+    return {"status": "ok", "id": gid, "goals": db.goals_list()}
 
 @app.post("/goals/{goal_id}/activate")
 def api_goals_activate(goal_id: int):
