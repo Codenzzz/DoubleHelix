@@ -524,23 +524,48 @@ def meta_reflect():
 
 @app.get("/emergence")
 def emergence_status():
-    births_data = db.kv_get("meta.births") or {"value":"0"}
-    births = int(births_data.get("value","0"))
+    births_data = db.kv_get("meta.births") or {"value": "0"}
+    births = int(births_data.get("value", "0"))
     metrics = db.kv_get("metrics") or {}
     policy_hist = db.get_policy_history(50)
     variances: Dict[str, float] = {}
     if len(policy_hist) >= 10:
-        for trait in ["creativity","conciseness","planning_focus","skepticism"]:
-            vals = [h.get(trait,0.0) for h in policy_hist[-10:] if isinstance(h, dict)]
+        for trait in ["creativity", "conciseness", "planning_focus", "skepticism"]:
+            vals = [h.get(trait, 0.0) for h in policy_hist[-10:] if isinstance(h, dict)]
             if len(vals) >= 2:
-                mean = sum(vals)/len(vals)
-                var = sum((v-mean)**2 for v in vals)/len(vals)
-                variances[trait] = round(var,4)
+                mean = sum(vals) / len(vals)
+                var = sum((v - mean) ** 2 for v in vals) / len(vals)
+                variances[trait] = round(var, 4)
     return {
         "emergent_principles": births,
         "policy_stability": variances,
         "avg_reply_score": metrics.get("avg_reply_score", 0),
         "total_interactions": metrics.get("total_replies", 0),
         "goals_completed": metrics.get("goals_completed", 0),
-        "current_policy": db.get_policy_vector()
+        "current_policy": db.get_policy_vector(),
     }
+
+# -----------------------------
+# Auto-tick background loop (env-driven)
+# -----------------------------
+import threading, time, os
+
+_AUTO_TICK_STARTED = False  # guard against double starts (e.g., reloads)
+AUTO_TICK_ENABLED = os.getenv("AUTO_TICK", "true").lower() == "true"
+AUTO_TICK_INTERVAL = int(os.getenv("AUTO_TICK_INTERVAL", "300"))  # seconds (default 5 min)
+
+def auto_tick(interval=AUTO_TICK_INTERVAL):
+    while True:
+        try:
+            print("[AutoTick] Running planner tick...")
+            tick()
+            print("[AutoTick] Done.\n")
+        except Exception as e:
+            print("[AutoTick ERROR]", e)
+        time.sleep(interval)
+
+# Start once per process
+if AUTO_TICK_ENABLED and not _AUTO_TICK_STARTED:
+    _AUTO_TICK_STARTED = True
+    threading.Thread(target=auto_tick, daemon=True).start()
+    print(f"[AutoTick] started (interval={AUTO_TICK_INTERVAL}s)")
