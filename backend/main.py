@@ -167,6 +167,8 @@ def _style_hint(vec: Dict[str, float]) -> str:
     if not prefs: prefs.append("balanced, helpful responses")
     prefs.append('If calculation is required, respond with JSON tool call {"tool":"calculator","tool_input":"EXPR"}.')
     prefs.append('If memory helps, respond with {"tool":"memory_search","tool_input":"query"}.')
+    # ✅ allow model to self-trigger web search when useful
+    prefs.append('If web info helps, respond with {"tool":"web_search","tool_input":"QUERY"}.')
     return "Style preferences: " + "; ".join(prefs) + "."
 
 # -----------------------------------------------------
@@ -409,11 +411,7 @@ def perturb_policy(vec: Dict[str, float], profile: str) -> Dict[str, float]:
     return p
 
 # -----------------------------------------------------
-#  Tool layer
-# -----------------------------------------------------
-
-# -----------------------------------------------------
-#  Tool call detector (needed by chat loop)
+#  Tool call detector
 # -----------------------------------------------------
 def _maybe_tool_call(text: str):
     """Return (is_tool_call, obj) if text is like:
@@ -553,7 +551,6 @@ def _run_tool(obj: Dict[str, Any]) -> str:
     # -----------------------------
     return f"unknown_tool: {tool}"
 
-
 # -----------------------------------------------------
 #  Chat
 # -----------------------------------------------------
@@ -582,6 +579,16 @@ def chat(p: ChatPayload):
 
         # ----- Command pre-handler (bypass model) -----
         cmd = p.prompt.strip()
+
+        # "search ..." or "web ..." -> force web_search tool
+        m1 = re.match(r'^(?:search|web)\s+(.+)$', cmd, flags=re.I)
+        if m1:
+            q = m1.group(1).strip()
+            tool_result = _run_tool({"tool": "web_search", "tool_input": q})
+            return {
+                "reply": f"(Tool web_search -> {tool_result})",
+                "meta": {"handled": "command_web_search", "query": q}
+            }
 
         # /memory status
         if re.fullmatch(r"/memory\s+status", cmd, flags=re.I):
@@ -710,7 +717,6 @@ def chat(p: ChatPayload):
 
     except Exception as e:
         return {"reply": f"[server_error] {type(e).__name__}: {e}", "meta": {"error": True}}
-
 
 # -----------------------------------------------------
 #  Planner / Tick
