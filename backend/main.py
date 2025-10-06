@@ -411,6 +411,34 @@ def perturb_policy(vec: Dict[str, float], profile: str) -> Dict[str, float]:
     return p
 
 # -----------------------------------------------------
+#  DDG HTML fallback (lightweight parser)
+# -----------------------------------------------------
+def _ddg_html_results(query: str, limit: int = 5) -> List[Dict[str, str]]:
+    try:
+        q = urllib.parse.quote(query)
+        url = f"https://duckduckgo.com/html/?q={q}"
+        with urllib.request.urlopen(url, timeout=12) as r:
+            html = r.read().decode("utf-8", errors="ignore")
+        items: List[Dict[str, str]] = []
+        for m in re.finditer(r'<a[^>]+class="[^"]*result__a[^"]*"[^>]*href="([^"]+)"[^>]*>(.*?)</a>', html, flags=re.I | re.S):
+            href = m.group(1)
+            title_raw = m.group(2)
+            title = re.sub("<.*?>", "", title_raw)
+            title = urllib.parse.unquote(re.sub(r"\s+", " ", title)).strip()
+            block_start = m.start()
+            snippet_match = re.search(r'class="[^"]*result__snippet[^"]*"[^>]*>(.*?)</', html[block_start:block_start+1500], flags=re.I | re.S)
+            snippet = ""
+            if snippet_match:
+                snippet = re.sub("<.*?>", "", snippet_match.group(1))
+                snippet = re.sub(r"\s+", " ", snippet).strip()
+            items.append({"title": title[:200], "url": href, "snippet": snippet[:280]})
+            if len(items) >= limit:
+                break
+        return items
+    except Exception:
+        return []
+
+# -----------------------------------------------------
 #  Tool call detector
 # -----------------------------------------------------
 def _maybe_tool_call(text: str):
@@ -455,17 +483,20 @@ def _run_tool(obj: Dict[str, Any]) -> str:
             return "web_search disabled (DRY_RUN)"
 
         try:
+            # Normalize common filler like "search the web for ..."
             query = arg.strip()
+            query = re.sub(r'^(?:the\s+web\s+for|the\s+internet\s+for|search\s+the\s+web\s+for)\s+', '', query, flags=re.I)
+            query = re.sub(r'\s+', ' ', query).strip()
             if not query:
                 return "web_search_error: empty query"
 
             # --- DuckDuckGo Instant Answer (no-auth) ---
             q = urllib.parse.quote(query)
             url = f"https://api.duckduckgo.com/?q={q}&format=json&no_html=1&skip_disambig=1"
-            with urllib.request.urlopen(url, timeout=8) as r:
+            with urllib.request.urlopen(url, timeout=12) as r:
                 data = json.loads(r.read().decode("utf-8", errors="ignore"))
 
-            results = []
+            results: List[Dict[str, str]] = []
 
             abstract = (data.get("AbstractText") or "").strip()
             if abstract:
@@ -491,6 +522,10 @@ def _run_tool(obj: Dict[str, Any]) -> str:
                         "url": item.get("FirstURL") or "",
                         "snippet": (item.get("Text") or "")[:280]
                     })
+
+            # ✅ Fallback to HTML scraping if IA yields nothing
+            if not results:
+                results = _ddg_html_results(query, limit=5)
 
             if not results:
                 results = [{"title": "No results", "url": "", "snippet": ""}]
@@ -529,7 +564,7 @@ def _run_tool(obj: Dict[str, Any]) -> str:
                     try:
                         parsed = json.loads(content)
                     except Exception:
-                        pass
+                        parsed = None
 
                     if isinstance(parsed, dict) and "results" in parsed and isinstance(parsed["results"], list):
                         payload = {"results": parsed["results"][:5]}
@@ -984,10 +1019,9 @@ if AUTO_TICK_ENABLED and not _AUTO_TICK_STARTED:
     threading.Thread(target=auto_tick, daemon=True).start()
     print(f"[AutoTick] started (interval={AUTO_TICK_INTERVAL}s)")
 
-
-
-
-
+# -----------------------------------------------------
+#  Debug endpoint: check env + network
+# -----------------------------------------------------
 @app.get("/debug/env")
 def debug_env():
     return {
