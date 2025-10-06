@@ -411,6 +411,7 @@ def perturb_policy(vec: Dict[str, float], profile: str) -> Dict[str, float]:
 # -----------------------------------------------------
 #  Tool layer
 # -----------------------------------------------------
+
 # -----------------------------------------------------
 #  Tool call detector (needed by chat loop)
 # -----------------------------------------------------
@@ -433,14 +434,9 @@ def _run_tool(obj: Dict[str, Any]) -> str:
     # Calculator (safer + NL/date guard)
     # -----------------------------
     if tool == "calculator":
-        # Ignore natural language or date-like inputs so we don't hijack simple questions
-        #  - Any letters? → not math.
-        #  - ISO/date-ish strings (YYYY-MM-DD or things with ":" time) → not math.
-        if re.search(r"[A-Za-z]", arg) or re.fullmatch(r"\s*\d{4}\s*-\s*\d{2}\s*-\s*\d{2}\s*", arg) or (":" in arg and re.search(r"\d", arg)):
+        if re.search(r"[A-Za-z]", arg) or re.fullmatch(r"\s*\d{4}\s*-\s*\d{2}\s*-\s*\d{2}\s*\s*", arg) or (":" in arg and re.search(r"\d", arg)):
             return "calc_error: natural language or date input ignored"
-
         try:
-            # Strictly allow digits and math ops only
             if re.fullmatch(r"[0-9\s+\-*/().]+", arg):
                 return str(eval(arg, {"__builtins__": {}}))
         except Exception as e:
@@ -448,29 +444,31 @@ def _run_tool(obj: Dict[str, Any]) -> str:
         return "calc_error: invalid input"
 
     # -----------------------------
-    # Memory search (unchanged)
+    # Memory search
     # -----------------------------
     if tool == "memory_search":
         return json.dumps({"memory_hits": db.search_facts(arg, limit=5)})
 
     # -----------------------------
-    # Web search (DuckDuckGo Instant Answer API)
+    # Web search (DDG + optional OpenAI rerank)
     # -----------------------------
     if tool == "web_search":
-        # Respect DRY_RUN flag to avoid outbound calls in certain environments
         if DRY_RUN:
             return "web_search disabled (DRY_RUN)"
 
         try:
-            # Use DuckDuckGo's no-auth Instant Answer endpoint
-            q = urllib.parse.quote(arg)
+            query = arg.strip()
+            if not query:
+                return "web_search_error: empty query"
+
+            # --- DuckDuckGo Instant Answer (no-auth) ---
+            q = urllib.parse.quote(query)
             url = f"https://api.duckduckgo.com/?q={q}&format=json&no_html=1&skip_disambig=1"
-            with urllib.request.urlopen(url, timeout=6) as r:
+            with urllib.request.urlopen(url, timeout=8) as r:
                 data = json.loads(r.read().decode("utf-8", errors="ignore"))
 
             results = []
 
-            # Prefer Abstract if present
             abstract = (data.get("AbstractText") or "").strip()
             if abstract:
                 results.append({
@@ -479,32 +477,73 @@ def _run_tool(obj: Dict[str, Any]) -> str:
                     "snippet": abstract
                 })
 
-            # Pull a few RelatedTopics items
             related = data.get("RelatedTopics") or []
             for item in related:
-                # Some items are nested with a 'Topics' list
-                if "Topics" in item and isinstance(item["Topics"], list):
+                if isinstance(item, dict) and "Topics" in item and isinstance(item["Topics"], list):
                     for t in item["Topics"]:
-                        if "FirstURL" in t or "Text" in t:
+                        if isinstance(t, dict) and ("FirstURL" in t or "Text" in t):
                             results.append({
                                 "title": (t.get("Text") or "").split(" - ")[0][:120],
                                 "url": t.get("FirstURL") or "",
                                 "snippet": (t.get("Text") or "")[:280]
                             })
-                else:
-                    if "FirstURL" in item or "Text" in item:
-                        results.append({
-                            "title": (item.get("Text") or "").split(" - ")[0][:120],
-                            "url": item.get("FirstURL") or "",
-                            "snippet": (item.get("Text") or "")[:280]
-                        })
+                elif isinstance(item, dict) and ("FirstURL" in item or "Text" in item):
+                    results.append({
+                        "title": (item.get("Text") or "").split(" - ")[0][:120],
+                        "url": item.get("FirstURL") or "",
+                        "snippet": (item.get("Text") or "")[:280]
+                    })
 
-            # Fall back if nothing meaningful
             if not results:
                 results = [{"title": "No results", "url": "", "snippet": ""}]
 
-            # Trim to a small, useful batch
-            return json.dumps({"results": results[:5]})
+            payload = {"results": results[:5]}
+            OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+
+            # Optional rerank/cleanup via OpenAI
+            if OPENAI_API_KEY and results:
+                try:
+                    from openai import OpenAI
+                    client = OpenAI(api_key=OPENAI_API_KEY)
+
+                    system_msg = (
+                        "You are a web result formatter. "
+                        "Return ONLY JSON: an array named 'results' of up to 5 objects "
+                        "with fields: title, url, snippet. No extra text."
+                    )
+                    user_msg = (
+                        f"Query: {query}\n\n"
+                        f"Here are raw results (may be noisy). Re-rank for relevance, dedupe, and compress snippets:\n"
+                        f"{json.dumps(results[:8])}"
+                    )
+
+                    resp = client.chat.completions.create(
+                        model="gpt-4o-mini",
+                        messages=[
+                            {"role": "system", "content": system_msg},
+                            {"role": "user", "content": user_msg},
+                        ],
+                        temperature=0.0
+                    )
+
+                    content = (resp.choices[0].message.content or "").strip()
+                    parsed = None
+                    try:
+                        parsed = json.loads(content)
+                    except Exception:
+                        pass
+
+                    if isinstance(parsed, dict) and "results" in parsed and isinstance(parsed["results"], list):
+                        payload = {"results": parsed["results"][:5]}
+                    elif isinstance(parsed, list):
+                        payload = {"results": parsed[:5]}
+                    else:
+                        payload = {"results": results[:5], "note": "llm_format_error_fallback"}
+
+                except Exception as e:
+                    payload = {"results": results[:5], "note": f"openai_rerank_error: {e}"}
+
+            return json.dumps(payload)
 
         except Exception as e:
             return f"web_search_error: {e}"
@@ -513,6 +552,7 @@ def _run_tool(obj: Dict[str, Any]) -> str:
     # Unknown tool
     # -----------------------------
     return f"unknown_tool: {tool}"
+
 
 # -----------------------------------------------------
 #  Chat
