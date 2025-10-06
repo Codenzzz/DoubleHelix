@@ -915,6 +915,20 @@ def api_history(limit: int = 50):
     items = _history_get()
     return {"history": items[-limit:] if limit and limit > 0 else items}
 
+
+# --- memory compact (safe) ---
+@app.post("/memory/compact")
+def api_memory_compact():
+    """
+    Soft-prune old chat records by lowering confidence on the oldest entries.
+    """
+    try:
+        from memory import _maybe_prune
+        _maybe_prune()
+        return {"ok": True, "msg": "memory compacted"}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
 # -----------------------------------------------------
 #  Memory admin endpoints (optional)
 # -----------------------------------------------------
