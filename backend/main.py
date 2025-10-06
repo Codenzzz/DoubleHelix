@@ -10,13 +10,22 @@ from dotenv import load_dotenv
 from providers import complete_many, reflect_json
 from utils import db
 
+# ✅ Persistent chat memory bridge + saver
+from memory import (
+    bridge_context as mem_bridge,
+    save_chat_turn as mem_save,
+    export_state as mem_export,
+    set_enabled as mem_set_enabled,
+)
+
 # =====================================================
-#  DoubleHelix API  —  Emergent Reflection Engine (v0.9.0)
+#  DoubleHelix API — Emergent Reflection Engine (v0.9.0)
 #  - Non-destructive Clean Eyes (policy-only reset)
 #  - Reality Bridge (drift/surprise anchoring)
 #  - Illusion Loop (sleep → dream → recall) in tick()
 #  - Goal-aware prompts, forgiving /goals input
 #  - Lightweight history buffer
+#  - ✅ Persistent chat memory (Continuity Bridge + saver)
 # =====================================================
 
 load_dotenv()
@@ -259,6 +268,29 @@ def prune_memory(max_items: int = 1000):
             db.upsert_fact(it["key"], it["value"], 0.01)
 
 # -----------------------------------------------------
+#  Memory command helpers (NEW)
+# -----------------------------------------------------
+def _memory_status() -> Dict[str, Any]:
+    facts = db.all_facts()
+    latest = sorted(facts, key=lambda x: x.get("ts",""))[-5:] if facts else []
+    return {
+        "enabled": True,
+        "total_facts": len(facts),
+        "latest": [{"key": f["key"], "value": f["value"], "confidence": f.get("confidence", 0.0)} for f in latest]
+    }
+
+def _memory_write(text: str, confidence: float = 0.95, key: Optional[str] = None) -> Dict[str, Any]:
+    k = key or f"note:{int(time.time())}"
+    db.upsert_fact(k, text.strip(), confidence)
+    _history_append({"kind": "memory_write", "key": k, "value": text.strip(), "confidence": confidence})
+    return {"ok": True, "key": k, "value": text.strip(), "confidence": confidence}
+
+def _memory_recent(limit: int = 5) -> List[Dict[str, Any]]:
+    facts = db.all_facts()
+    facts = sorted(facts, key=lambda x: x.get("ts",""))[-limit:] if facts else []
+    return [{"key": f["key"], "value": f["value"], "confidence": f.get("confidence", 0.0)} for f in facts]
+
+# -----------------------------------------------------
 #  Clean Eyes (non-destructive) + Reality Bridge
 # -----------------------------------------------------
 BASELINE_POLICY_KEY = "cleaneyes.baseline_policy"
@@ -414,6 +446,29 @@ def chat(p: ChatPayload):
     try:
         _maybe_rate_limit(max(50, len(p.prompt)//3))
 
+        # ----- Command pre-handler (bypass model) -----
+        cmd = p.prompt.strip()
+
+        # /memory status
+        if re.fullmatch(r"/memory\s+status", cmd, flags=re.I):
+            status = _memory_status()
+            return {"reply": json.dumps(status), "meta": {"handled": "memory_status"}}
+
+        # store fact: "..."  OR  write memory: "..."
+        m = re.match(r'^(store\s+fact|write\s+memory)\s*:\s*"?(.+?)"?\s*$', cmd, flags=re.I)
+        if m:
+            text = m.group(2)
+            result = _memory_write(text, confidence=0.95)
+            return {"reply": f"[memory_ok] key={result['key']}", "meta": {"handled": "memory_write", "value": text}}
+
+        # recall last N facts
+        m = re.match(r'^recall\s+last\s+(\d+)\s+facts$', cmd, flags=re.I)
+        if m:
+            n = max(1, min(100, int(m.group(1))))
+            facts = _memory_recent(n)
+            return {"reply": json.dumps({"recent": facts}), "meta": {"handled": "memory_recent", "n": n}}
+
+        # ----- Normal model path -----
         vec = db.get_policy_vector()
         style = get_style_prompt(vec)
         memory = db.top_facts(5)
@@ -422,7 +477,12 @@ def chat(p: ChatPayload):
         goal_text = _goal_text()
         goal_prefix = f"Active goal: {goal_text}\n\n" if goal_text else ""
         bridge = _bridge_context(k_goal=1, k_facts=7, k_emergent=2) if _should_bridge() else ""
-        context = goal_prefix + bridge + _context_from_memory(p.prompt, k=5)
+
+        # ✅ Persistent Continuity Bridge (recent chats + emergent)
+        continuity = mem_bridge(p.prompt)
+
+        # Final context (order matters: goal → runtime bridge → persistent bridge → fact snippets)
+        context = goal_prefix + bridge + (continuity or "") + _context_from_memory(p.prompt, k=5)
 
         outs = []
         used_profiles = []
@@ -482,9 +542,24 @@ def chat(p: ChatPayload):
             "candidates": [t for _, t, _ in scored],
             "chosen": best_text,
             "score": best_score,
-            "bridge_used": bool(bridge),
+            "bridge_used": bool(bridge or continuity),
             "surprise": surprise
         })
+
+        # ✅ Persist this chat turn to memory (non-blocking / best-effort)
+        try:
+            mem_save(
+                p.prompt,
+                best_text,
+                meta={
+                    "policy": vec,
+                    "score": best_score,
+                    "surprise": surprise,
+                    "profiles": used_profiles
+                }
+            )
+        except Exception:
+            pass
 
         return {
             "reply": best_text,
@@ -495,7 +570,7 @@ def chat(p: ChatPayload):
                 "used_perspectives": bool(p.use_perspectives),
                 "profiles": used_profiles,
                 "policy": vec,
-                "bridge_used": bool(bridge),
+                "bridge_used": bool(bridge or continuity),
             }
         }
 
@@ -631,12 +706,44 @@ def api_clean_apply(alpha: Optional[float] = None):
     return clean_eyes_apply(alpha)
 
 # -----------------------------------------------------
+#  Memory endpoints (lightweight)  (NEW)
+# -----------------------------------------------------
+@app.get("/memory/status")
+def api_memory_status():
+    return _memory_status()
+
+class MemoryIn(BaseModel):
+    text: str
+    confidence: Optional[float] = 0.95
+    key: Optional[str] = None
+
+@app.post("/memory/fact")
+def api_memory_fact(p: MemoryIn):
+    return _memory_write(p.text, confidence=float(p.confidence or 0.95), key=p.key)
+
+@app.get("/memory/recent")
+def api_memory_recent(limit: int = 5):
+    return {"recent": _memory_recent(max(1, min(100, limit)))}
+
+# -----------------------------------------------------
 #  History endpoint
 # -----------------------------------------------------
 @app.get("/history")
 def api_history(limit: int = 50):
     items = _history_get()
     return {"history": items[-limit:] if limit and limit > 0 else items}
+
+# -----------------------------------------------------
+#  Memory admin endpoints (optional)
+# -----------------------------------------------------
+@app.get("/memory/export")
+def api_memory_export():
+    return JSONResponse(mem_export())
+
+@app.post("/memory/enable")
+def api_memory_enable(flag: bool = Query(True, description="Enable or disable persistent chat memory")):
+    mem_set_enabled(flag)
+    return {"ok": True, "enabled": flag}
 
 # -----------------------------------------------------
 #  Goals (robust parsing)
