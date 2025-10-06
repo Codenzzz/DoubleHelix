@@ -649,6 +649,30 @@ def chat(p: ChatPayload):
             n = max(1, min(100, int(m.group(1))))
             facts = _memory_recent(n)
             return {"reply": json.dumps({"recent": facts}), "meta": {"handled": "memory_recent", "n": n}}
+        # Ask-about-memory awareness (before normal model path)
+        if _is_memory_awareness_query(cmd):
+            st = mem_export()  # from memory.py
+            enabled = bool(st.get("enabled"))
+            turns = int((st.get("stats") or {}).get("turns", 0))
+            recent_n = int((st.get("recent") or {}).get("n", 0))
+            recent_items = (st.get("recent") or {}).get("items", [])[-3:]  # last 3, compact
+
+            lines = []
+            for it in recent_items:
+                p = str(it.get("prompt", "")).replace("\n", " ")[:70]
+                r = str(it.get("reply", "")).replace("\n", " ")[:80]
+                ts = it.get("ts", "")
+                lines.append(f"- {ts}  Q:{p} | A:{r}")
+
+            summary = "\n".join(lines) if lines else "(no recent snapshots yet)"
+            return {
+                "reply": (
+                    "Yes — I persist chat turns now.\n"
+                    f"Enabled: {enabled} | Stored turns: {turns} | Recent window: {recent_n}\n"
+                    f"Recent chat snapshots:\n{summary}"
+                ),
+                "meta": {"handled": "memory_awareness", "memory_enabled": enabled, "turns": turns, "recent_n": recent_n}
+            }
 
         # ----- Normal model path -----
         vec = db.get_policy_vector()
@@ -728,6 +752,7 @@ def chat(p: ChatPayload):
             "surprise": surprise
         })
 
+
         # ✅ Persist this chat turn to memory
         try:
             mem_save(
@@ -758,6 +783,22 @@ def chat(p: ChatPayload):
 
     except Exception as e:
         return {"reply": f"[server_error] {type(e).__name__}: {e}", "meta": {"error": True}}
+# -----------------------------------------------------
+#  Memory awareness helper
+# -----------------------------------------------------
+def _is_memory_awareness_query(text: str) -> bool:
+    t = (text or "").lower().strip()
+    if not t:
+        return False
+    has_memory_word = any(w in t for w in (
+        "remember", "memory", "persist", "save", "store", "history", "remembering"
+    ))
+    has_convo_word = any(w in t for w in (
+        "chat", "chats", "conversation", "conversations", "messages", "previous", "prior", "before"
+    ))
+    # avoid clashing with the explicit status command
+    not_explicit_cmd = not re.fullmatch(r"/memory\s+status", t)
+    return has_memory_word and has_convo_word and not_explicit_cmd
 
 # -----------------------------------------------------
 #  Planner / Tick
