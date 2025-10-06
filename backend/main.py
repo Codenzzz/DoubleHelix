@@ -983,3 +983,23 @@ if AUTO_TICK_ENABLED and not _AUTO_TICK_STARTED:
     _AUTO_TICK_STARTED = True
     threading.Thread(target=auto_tick, daemon=True).start()
     print(f"[AutoTick] started (interval={AUTO_TICK_INTERVAL}s)")
+
+
+
+
+
+@app.get("/debug/env")
+def debug_env():
+    return {
+        "DRY_RUN": DRY_RUN,
+        "OPENAI_API_KEY_set": bool(os.getenv("OPENAI_API_KEY")),
+        "internet_test": _test_internet(),
+    }
+
+def _test_internet():
+    try:
+        with urllib.request.urlopen("https://api.duckduckgo.com/?q=test&format=json", timeout=5) as r:
+            data = json.loads(r.read().decode("utf-8"))
+            return {"ok": True, "len": len(data)}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
