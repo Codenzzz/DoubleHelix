@@ -22,12 +22,6 @@ from memory import (
 
 # =====================================================
 #  DoubleHelix API — Emergent Reflection Engine (v0.9.0)
-#  - Non-destructive Clean Eyes (policy-only reset)
-#  - Reality Bridge (drift/surprise anchoring)
-#  - Illusion Loop (sleep → dream → recall) in tick()
-#  - Goal-aware prompts, forgiving /goals input
-#  - Lightweight history buffer
-#  - ✅ Persistent chat memory (Continuity Bridge + saver)
 # =====================================================
 
 load_dotenv()
@@ -99,6 +93,16 @@ REQUESTS_PER_MIN = int(os.getenv("REQUESTS_PER_MIN", "20"))
 TOKENS_PER_MIN   = int(os.getenv("TOKENS_PER_MIN", "12000"))
 N_SAMPLES        = int(os.getenv("N_SAMPLES", "3"))
 DRY_RUN          = os.getenv("DRY_RUN", "true").lower() == "true"
+
+# -----------------------------------------------------
+#  Simple HTTP helper with headers (avoids 403/blank)
+# -----------------------------------------------------
+USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+
+def _http_get(url: str, timeout: int = 12) -> bytes:
+    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT, "Accept": "*/*"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return r.read()
 
 # -----------------------------------------------------
 #  Rate Limiting
@@ -367,7 +371,7 @@ def _should_bridge() -> bool:
     return last_surprise >= bridge_s or max_var >= bridge_v
 
 # -----------------------------------------------------
-#  Illusion Loop (sleep → dream → recall) within tick()
+#  Illusion Loop (sleep → dream → recall)
 # -----------------------------------------------------
 def illusion_sleep_dream_recall():
     anchors = _bridge_context(k_goal=1, k_facts=7, k_emergent=2)
@@ -417,8 +421,7 @@ def _ddg_html_results(query: str, limit: int = 5) -> List[Dict[str, str]]:
     try:
         q = urllib.parse.quote(query)
         url = f"https://duckduckgo.com/html/?q={q}"
-        with urllib.request.urlopen(url, timeout=12) as r:
-            html = r.read().decode("utf-8", errors="ignore")
+        html = _http_get(url, timeout=12).decode("utf-8", errors="ignore")
         items: List[Dict[str, str]] = []
         for m in re.finditer(r'<a[^>]+class="[^"]*result__a[^"]*"[^>]*href="([^"]+)"[^>]*>(.*?)</a>', html, flags=re.I | re.S):
             href = m.group(1)
@@ -457,7 +460,7 @@ def _run_tool(obj: Dict[str, Any]) -> str:
     tool, arg = obj.get("tool"), str(obj.get("tool_input", "")).strip()
 
     # -----------------------------
-    # Calculator (safer + NL/date guard)
+    # Calculator
     # -----------------------------
     if tool == "calculator":
         if re.search(r"[A-Za-z]", arg) or re.fullmatch(r"\s*\d{4}\s*-\s*\d{2}\s*-\s*\d{2}\s*\s*", arg) or (":" in arg and re.search(r"\d", arg)):
@@ -483,7 +486,7 @@ def _run_tool(obj: Dict[str, Any]) -> str:
             return "web_search disabled (DRY_RUN)"
 
         try:
-            # Normalize common filler like "search the web for ..."
+            # Normalize phrasing like: "search the web for X"
             query = arg.strip()
             query = re.sub(r'^(?:the\s+web\s+for|the\s+internet\s+for|search\s+the\s+web\s+for)\s+', '', query, flags=re.I)
             query = re.sub(r'\s+', ' ', query).strip()
@@ -493,20 +496,23 @@ def _run_tool(obj: Dict[str, Any]) -> str:
             # --- DuckDuckGo Instant Answer (no-auth) ---
             q = urllib.parse.quote(query)
             url = f"https://api.duckduckgo.com/?q={q}&format=json&no_html=1&skip_disambig=1"
-            with urllib.request.urlopen(url, timeout=12) as r:
-                data = json.loads(r.read().decode("utf-8", errors="ignore"))
+            try:
+                data = json.loads(_http_get(url, timeout=12).decode("utf-8", errors="ignore"))
+            except Exception:
+                data = {}
 
             results: List[Dict[str, str]] = []
 
-            abstract = (data.get("AbstractText") or "").strip()
+            abstract = (data.get("AbstractText") or "").strip() if isinstance(data, dict) else ""
             if abstract:
                 results.append({
-                    "title": data.get("Heading") or "Summary",
-                    "url": data.get("AbstractURL") or "",
+                    "title": (data.get("Heading") or "Summary") if isinstance(data, dict) else "Summary",
+                    "url": (data.get("AbstractURL") or "") if isinstance(data, dict) else "",
                     "snippet": abstract
                 })
 
-            related = data.get("RelatedTopics") or []
+            related = data.get("RelatedTopics") if isinstance(data, dict) else []
+            related = related or []
             for item in related:
                 if isinstance(item, dict) and "Topics" in item and isinstance(item["Topics"], list):
                     for t in item["Topics"]:
@@ -599,7 +605,7 @@ def chat(p: ChatPayload):
     try:
         _maybe_rate_limit(max(50, len(p.prompt)//3))
 
-        # === NEW: Direct tool execution if user sends JSON ===
+        # === JSON tool pass-through ===
         try:
             _as_json = json.loads(p.prompt)
             if isinstance(_as_json, dict) and "tool" in _as_json and "tool_input" in _as_json:
@@ -610,7 +616,7 @@ def chat(p: ChatPayload):
                 }
         except Exception:
             pass
-        # === end NEW ===
+        # === end pass-through ===
 
         # ----- Command pre-handler (bypass model) -----
         cmd = p.prompt.strip()
@@ -882,7 +888,7 @@ def api_clean_apply(alpha: Optional[float] = None):
     return clean_eyes_apply(alpha)
 
 # -----------------------------------------------------
-#  Memory endpoints (lightweight)  (NEW)
+#  Memory endpoints (lightweight)
 # -----------------------------------------------------
 @app.get("/memory/status")
 def api_memory_status():
@@ -1032,8 +1038,7 @@ def debug_env():
 
 def _test_internet():
     try:
-        with urllib.request.urlopen("https://api.duckduckgo.com/?q=test&format=json", timeout=5) as r:
-            data = json.loads(r.read().decode("utf-8"))
-            return {"ok": True, "len": len(data)}
+        data = json.loads(_http_get("https://api.duckduckgo.com/?q=test&format=json", timeout=6).decode("utf-8"))
+        return {"ok": True, "len": len(data)}
     except Exception as e:
         return {"ok": False, "error": str(e)}
