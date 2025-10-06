@@ -1,3 +1,4 @@
+// src/App.jsx
 import React, { useEffect, useMemo, useState } from "react";
 
 /** ------------ API base resolution ------------ */
@@ -35,6 +36,16 @@ async function postJSON(path, body, opts = {}) {
   if (!res.ok) {
     const txt = await res.text().catch(() => "");
     throw new Error(`POST ${path} → ${res.status} ${res.statusText} ${txt}`);
+  }
+  return res.json();
+}
+
+// Generic DELETE
+async function del(path) {
+  const res = await fetch(apiURL(path), { method: "DELETE" });
+  if (!res.ok) {
+    const txt = await res.text().catch(() => "");
+    throw new Error(`DELETE ${path} → ${res.status} ${res.statusText} ${txt}`);
   }
   return res.json();
 }
@@ -165,6 +176,36 @@ export default function App() {
     }
   }
 
+  async function deleteGoal(id) {
+    setError(null);
+    try {
+      await del(`/goals/${id}`);
+      await refresh();
+    } catch (e) {
+      setError(String(e));
+    }
+  }
+
+  async function dedupeGoals() {
+    setError(null);
+    try {
+      await postJSON("/goals/dedupe");
+      await refresh();
+    } catch (e) {
+      setError(String(e));
+    }
+  }
+
+  async function compactMemory() {
+    setError(null);
+    try {
+      await postJSON("/memory/compact", {});
+      await refresh();
+    } catch (e) {
+      setError(String(e));
+    }
+  }
+
   async function tick() {
     setError(null);
     try {
@@ -188,11 +229,10 @@ export default function App() {
 
   async function applyCleanEyes() {
     try {
-      const body = cleanAlpha ? { method: "POST" } : { method: "POST" };
       const url = cleanAlpha
         ? `/clean/apply?alpha=${encodeURIComponent(cleanAlpha)}`
         : "/clean/apply";
-      await postJSON(url, undefined, body);
+      await postJSON(url, undefined);
       await refresh();
     } catch (e) {
       setError(String(e));
@@ -234,8 +274,7 @@ export default function App() {
 
   // Helpers
   const activeGoalObj =
-    goals.find((g) => g.active) ||
-    null;
+    goals.find((g) => g.active) || null;
 
   return (
     <div className="container">
@@ -294,6 +333,9 @@ export default function App() {
               style={{ flex: 1 }}
             />
             <button onClick={addGoal}>Add</button>
+            <button className="ghost" title="Remove duplicate goals" onClick={dedupeGoals}>
+              Dedupe
+            </button>
           </div>
           <div style={{ marginTop: 10 }}>
             {goals.map((g) => (
@@ -306,6 +348,9 @@ export default function App() {
                     Activate
                   </button>
                 )}
+                <button className="ghost" onClick={() => deleteGoal(g.id)} title="Delete goal">
+                  Delete
+                </button>
               </div>
             ))}
             {!goals.length && <div className="muted">No goals yet. Add one above.</div>}
@@ -322,6 +367,9 @@ export default function App() {
             <span className="pill">
               surprise: {typeof emergence?.surprise === "number" ? emergence.surprise.toFixed(3) : "-"}
             </span>
+            <button className="pill" onClick={compactMemory} title="Deduplicate and prune facts">
+              Compact Memory
+            </button>
           </div>
           {!!emergence?.illusion && (
             <details style={{ marginTop: 8 }}>
