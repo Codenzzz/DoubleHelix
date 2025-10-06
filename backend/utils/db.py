@@ -1,190 +1,285 @@
-import os, time, sqlite3, json
-from typing import List, Dict, Any
+# backend/utils/db.py
 
-DB_PATH = os.path.join(os.path.dirname(__file__), "..", "doublehelix.db")
+import os
+import json
+import time
+from typing import List, Dict, Any, Optional
 
-def _conn():
-    return sqlite3.connect(DB_PATH, check_same_thread=False)
+from sqlalchemy import (
+    create_engine, Column, Integer, String, Float, Text, LargeBinary, Boolean,
+    select, update, func
+)
+from sqlalchemy.orm import sessionmaker, declarative_base, scoped_session
 
+# ---------------------------------------------------------------------
+# Engine / Session
+# ---------------------------------------------------------------------
+# Prefer Postgres from env; fall back to a persistent SQLite path for local use.
+DB_PATH = os.getenv("SQLITE_PATH", os.path.join(os.path.dirname(__file__), "..", "doublehelix.db"))
+DATABASE_URL = os.getenv("DATABASE_URL", f"sqlite:///{DB_PATH}")
+
+# psycopg2 driver hint if user pasted a bare postgres URL
+if DATABASE_URL.startswith("postgresql://") and "+psycopg2" not in DATABASE_URL:
+    DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+psycopg2://", 1)
+
+engine = create_engine(DATABASE_URL, pool_pre_ping=True)
+SessionLocal = scoped_session(sessionmaker(bind=engine, autocommit=False, autoflush=False))
+Base = declarative_base()
+
+
+def _now_str() -> str:
+    return time.strftime("%Y-%m-%d %H:%M:%S")
+
+
+# ---------------------------------------------------------------------
+# Models (schema-compatible with your previous tables)
+# ---------------------------------------------------------------------
+class Fact(Base):
+    __tablename__ = "facts"
+    key = Column(String, primary_key=True)
+    value = Column(Text, nullable=False)
+    confidence = Column(Float, nullable=False, default=0.8)
+    ts = Column(String, nullable=False)
+    embedding = Column(LargeBinary, nullable=True)
+
+
+class Policy(Base):
+    __tablename__ = "policy"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    ts = Column(String, nullable=False)
+    vector = Column(Text, nullable=False)
+
+
+class KV(Base):
+    __tablename__ = "kv"
+    key = Column(String, primary_key=True)
+    data = Column(Text, nullable=False)
+    ts = Column(String, nullable=False)
+
+
+class Goal(Base):
+    __tablename__ = "goals"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    text = Column(Text, nullable=False)
+    active = Column(Boolean, nullable=False, default=False)
+    ts = Column(String, nullable=False)
+
+
+# ---------------------------------------------------------------------
+# Init (creates tables if missing). FTS table is removed (Postgres-safe).
+# ---------------------------------------------------------------------
 def init():
-    with _conn() as con:
-        con.execute("PRAGMA journal_mode=WAL;")
-        con.execute("""
-            CREATE TABLE IF NOT EXISTS facts (
-                key TEXT PRIMARY KEY,
-                value TEXT NOT NULL,
-                confidence REAL NOT NULL DEFAULT 0.8,
-                ts TEXT NOT NULL,
-                embedding BLOB
-            )
-        """)
-        con.execute("CREATE VIRTUAL TABLE IF NOT EXISTS facts_fts USING fts5(key, value)")
-        con.execute("""
-            CREATE TABLE IF NOT EXISTS policy (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                ts TEXT NOT NULL,
-                vector TEXT NOT NULL
-            )
-        """)
-        con.execute("""
-            CREATE TABLE IF NOT EXISTS kv (
-                key TEXT PRIMARY KEY,
-                data TEXT NOT NULL,
-                ts TEXT NOT NULL
-            )
-        """)
-        con.execute("""
-            CREATE TABLE IF NOT EXISTS goals (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                text TEXT NOT NULL,
-                active INTEGER NOT NULL DEFAULT 0,
-                ts TEXT NOT NULL
-            )
-        """)
-        con.commit()
+    # ensure local dir for SQLite if used
+    if DATABASE_URL.startswith("sqlite:///"):
+        os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+    Base.metadata.create_all(bind=engine)
 
-# --- FIXED: FTS-safe upsert (no ON CONFLICT on virtual table) ---
-def upsert_fact(key: str, value: str, conf: float = 0.8, embedding: bytes | None = None):
-    ts = time.strftime("%Y-%m-%d %H:%M:%S")
-    with _conn() as con:
-        # upsert into main table
-        con.execute("""
-            INSERT INTO facts(key,value,confidence,ts,embedding)
-            VALUES(?,?,?,?,?)
-            ON CONFLICT(key) DO UPDATE SET
-                value=excluded.value,
-                confidence=excluded.confidence,
-                ts=excluded.ts,
-                embedding=COALESCE(excluded.embedding, facts.embedding)
-        """, (key, value, conf, ts, embedding))
 
-        # safely refresh the FTS entry
-        row = con.execute("SELECT rowid FROM facts WHERE key=?", (key,)).fetchone()
-        if row:
-            rid = row[0]
-            con.execute("DELETE FROM facts_fts WHERE rowid=?", (rid,))
-            con.execute("INSERT INTO facts_fts(rowid, key, value) VALUES(?,?,?)", (rid, key, value))
-        con.commit()
+# ---------------------------------------------------------------------
+# Facts
+# ---------------------------------------------------------------------
+def upsert_fact(key: str, value: str, conf: float = 0.8, embedding: Optional[bytes] = None):
+    """Insert or update a fact by key (cross-DB safe)."""
+    ts = _now_str()
+    s = SessionLocal()
+    try:
+        obj = s.get(Fact, key)
+        if obj is None:
+            obj = Fact(key=key, value=value, confidence=conf, ts=ts, embedding=embedding)
+            s.add(obj)
+        else:
+            obj.value = value
+            obj.confidence = conf
+            obj.ts = ts
+            if embedding is not None:
+                obj.embedding = embedding
+        s.commit()
+    except Exception:
+        s.rollback()
+        raise
+    finally:
+        s.close()
 
-# --- NEW: helper to rebuild the FTS index if needed ---
+
 def reindex_fts():
-    """Rebuild the FTS index from facts table."""
-    with _conn() as con:
-        con.execute("DELETE FROM facts_fts")
-        con.execute("INSERT INTO facts_fts(rowid, key, value) SELECT rowid, key, value FROM facts")
-        con.commit()
-
-def get_fact(key: str) -> Dict[str, Any] | None:
-    with _conn() as con:
-        cur = con.execute("SELECT key,value,confidence,ts FROM facts WHERE key=?", (key,))
-        row = cur.fetchone()
-        if row:
-            k,v,c,ts = row
-            return {"key":k,"value":v,"confidence":c,"ts":ts}
+    """No-op now (used to rebuild SQLite FTS). Kept for compatibility."""
     return None
+
+
+def get_fact(key: str) -> Optional[Dict[str, Any]]:
+    s = SessionLocal()
+    try:
+        obj = s.get(Fact, key)
+        if not obj:
+            return None
+        return {"key": obj.key, "value": obj.value, "confidence": obj.confidence, "ts": obj.ts}
+    finally:
+        s.close()
+
 
 def all_facts() -> List[Dict[str, Any]]:
-    with _conn() as con:
-        cur = con.execute("SELECT key,value,confidence,ts FROM facts ORDER BY ts DESC")
-        return [{"key":k,"value":v,"confidence":c,"ts":ts} for (k,v,c,ts) in cur.fetchall()]
+    s = SessionLocal()
+    try:
+        rows = s.execute(select(Fact).order_by(Fact.ts.desc())).scalars().all()
+        return [{"key": r.key, "value": r.value, "confidence": r.confidence, "ts": r.ts} for r in rows]
+    finally:
+        s.close()
+
 
 def top_facts(limit: int = 5) -> List[Dict[str, Any]]:
-    with _conn() as con:
-        cur = con.execute("SELECT key,value,confidence,ts FROM facts ORDER BY ts DESC LIMIT ?", (limit,))
-        return [{"key":k,"value":v,"confidence":c,"ts":ts} for (k,v,c,ts) in cur.fetchall()]
+    s = SessionLocal()
+    try:
+        rows = s.execute(select(Fact).order_by(Fact.ts.desc()).limit(limit)).scalars().all()
+        return [{"key": r.key, "value": r.value, "confidence": r.confidence, "ts": r.ts} for r in rows]
+    finally:
+        s.close()
+
 
 def search_facts(query: str, limit: int = 5) -> List[Dict[str, Any]]:
-    tokens = " ".join(t for t in query.split() if len(t) > 2)
-    with _conn() as con:
-        try:
-            cur = con.execute("""
-                SELECT f.key, f.value, f.confidence, f.ts
-                FROM facts_fts s JOIN facts f ON f.rowid = s.rowid
-                WHERE s.value MATCH ? LIMIT ?
-            """, (tokens, limit))
-            return [{"key":k,"value":v,"confidence":c,"ts":ts} for (k,v,c,ts) in cur.fetchall()]
-        except sqlite3.OperationalError:
-            cur = con.execute("SELECT key,value,confidence,ts FROM facts WHERE value LIKE ? ORDER BY ts DESC LIMIT ?", (f"%{query}%", limit))
-            return [{"key":k,"value":v,"confidence":c,"ts":ts} for (k,v,c,ts) in cur.fetchall()]
+    """
+    Portable search that works on both Postgres and SQLite.
+    - Postgres: ILIKE (case-insensitive)
+    - SQLite: LIKE (case-insensitive-ish by default for ASCII)
+    """
+    s = SessionLocal()
+    try:
+        pattern = f"%{query}%"
+        if DATABASE_URL.startswith("postgresql"):
+            filt = Fact.value.ilike(pattern)  # Postgres ILIKE
+        else:
+            filt = Fact.value.like(pattern)
+        rows = s.execute(select(Fact).where(filt).order_by(Fact.ts.desc()).limit(limit)).scalars().all()
+        return [{"key": r.key, "value": r.value, "confidence": r.confidence, "ts": r.ts} for r in rows]
+    finally:
+        s.close()
 
-# --- Policy vector ---
-def get_policy_vector(default: Dict[str, float] | None = None) -> Dict[str, float]:
-    with _conn() as con:
-        cur = con.execute("SELECT vector FROM policy ORDER BY id DESC LIMIT 1")
-        row = cur.fetchone()
+
+# ---------------------------------------------------------------------
+# Policy vector
+# ---------------------------------------------------------------------
+def get_policy_vector(default: Optional[Dict[str, float]] = None) -> Dict[str, float]:
+    s = SessionLocal()
+    try:
+        row = s.execute(select(Policy).order_by(Policy.id.desc()).limit(1)).scalars().first()
         if row:
             try:
-                return json.loads(row[0])
+                return json.loads(row.vector)
             except Exception:
                 pass
-    return default or {"creativity":0.0, "conciseness":0.0, "skepticism":0.0, "planning_focus":0.0}
+        return default or {"creativity": 0.0, "conciseness": 0.0, "skepticism": 0.0, "planning_focus": 0.0}
+    finally:
+        s.close()
+
 
 def set_policy_vector(vec: Dict[str, float]):
-    ts = time.strftime("%Y-%m-%d %H:%M:%S")
-    with _conn() as con:
-        con.execute("INSERT INTO policy(ts, vector) VALUES(?,?)", (ts, json.dumps(vec)))
-        con.commit()
+    s = SessionLocal()
+    try:
+        s.add(Policy(ts=_now_str(), vector=json.dumps(vec)))
+        s.commit()
+    except Exception:
+        s.rollback()
+        raise
+    finally:
+        s.close()
+
 
 def get_policy_history(last: int = 20) -> List[Dict[str, Any]]:
-    with _conn() as con:
-        cur = con.execute("SELECT ts, vector FROM policy ORDER BY id DESC LIMIT ?", (last,))
-        rows = cur.fetchall()
-        hist = []
-        for (ts, vec) in rows:
+    s = SessionLocal()
+    try:
+        rows = s.execute(select(Policy).order_by(Policy.id.desc()).limit(last)).scalars().all()
+        hist: List[Dict[str, Any]] = []
+        for r in rows:
             try:
-                hist.append(json.loads(vec))
-            except:
-                hist.append({})
-        return hist[::-1]
-
-# --- KV store ---
-def kv_upsert(key: str, data: Dict[str, Any]):
-    ts = time.strftime("%Y-%m-%d %H:%M:%S")
-    with _conn() as con:
-        con.execute("""
-            INSERT INTO kv(key, data, ts)
-            VALUES(?,?,?)
-            ON CONFLICT(key) DO UPDATE SET
-                data=excluded.data,
-                ts=excluded.ts
-        """, (key, json.dumps(data), ts))
-        con.commit()
-
-def kv_get(key: str) -> Dict[str, Any] | None:
-    with _conn() as con:
-        cur = con.execute("SELECT data FROM kv WHERE key=?", (key,))
-        row = cur.fetchone()
-        if row:
-            try:
-                return json.loads(row[0])
+                hist.append(json.loads(r.vector))
             except Exception:
-                return None
-    return None
+                hist.append({})
+        return hist[::-1]  # oldest first
+    finally:
+        s.close()
 
-# --- Goals ---
+
+# ---------------------------------------------------------------------
+# KV store
+# ---------------------------------------------------------------------
+def kv_upsert(key: str, data: Dict[str, Any]):
+    s = SessionLocal()
+    try:
+        ts = _now_str()
+        obj = s.get(KV, key)
+        payload = json.dumps(data)
+        if obj is None:
+            s.add(KV(key=key, data=payload, ts=ts))
+        else:
+            obj.data = payload
+            obj.ts = ts
+        s.commit()
+    except Exception:
+        s.rollback()
+        raise
+    finally:
+        s.close()
+
+
+def kv_get(key: str) -> Optional[Dict[str, Any]]:
+    s = SessionLocal()
+    try:
+        obj = s.get(KV, key)
+        if not obj:
+            return None
+        try:
+            return json.loads(obj.data)
+        except Exception:
+            return None
+    finally:
+        s.close()
+
+
+# ---------------------------------------------------------------------
+# Goals
+# ---------------------------------------------------------------------
 def goals_list() -> List[Dict[str, Any]]:
-    with _conn() as con:
-        cur = con.execute("SELECT id, text, active, ts FROM goals ORDER BY id DESC")
-        return [{"id":i, "text":t, "active":bool(a), "ts":ts} for (i,t,a,ts) in cur.fetchall()]
+    s = SessionLocal()
+    try:
+        rows = s.execute(select(Goal).order_by(Goal.id.desc())).scalars().all()
+        return [{"id": g.id, "text": g.text, "active": bool(g.active), "ts": g.ts} for g in rows]
+    finally:
+        s.close()
+
 
 def goals_add(text: str) -> int:
-    ts = time.strftime("%Y-%m-%d %H:%M:%S")
-    with _conn() as con:
-        cur = con.execute("INSERT INTO goals(text, active, ts) VALUES(?,?,?)", (text, 0, ts))
-        con.commit()
-        return cur.lastrowid
+    s = SessionLocal()
+    try:
+        g = Goal(text=text, active=False, ts=_now_str())
+        s.add(g)
+        s.commit()
+        return g.id
+    except Exception:
+        s.rollback()
+        raise
+    finally:
+        s.close()
+
 
 def goals_activate(goal_id: int):
-    with _conn() as con:
-        con.execute("UPDATE goals SET active=0")
-        con.execute("UPDATE goals SET active=1 WHERE id=?", (goal_id,))
-        con.commit()
+    s = SessionLocal()
+    try:
+        # Deactivate all, then activate the chosen one.
+        s.execute(update(Goal).values(active=False))
+        s.execute(update(Goal).where(Goal.id == goal_id).values(active=True))
+        s.commit()
+    except Exception:
+        s.rollback()
+        raise
+    finally:
+        s.close()
 
-def goal_active() -> Dict[str, Any] | None:
-    with _conn() as con:
-        cur = con.execute("SELECT id, text, ts FROM goals WHERE active=1 ORDER BY id DESC LIMIT 1")
-        row = cur.fetchone()
+
+def goal_active() -> Optional[Dict[str, Any]]:
+    s = SessionLocal()
+    try:
+        row = s.execute(select(Goal).where(Goal.active.is_(True)).order_by(Goal.id.desc()).limit(1)).scalars().first()
         if row:
-            i,t,ts = row
-            return {"id":i, "text":t, "ts":ts}
-    return None
+            return {"id": row.id, "text": row.text, "ts": row.ts}
+        return None
+    finally:
+        s.close()
