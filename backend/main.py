@@ -927,6 +927,49 @@ def api_memory_enable(flag: bool = Query(True, description="Enable or disable pe
     mem_set_enabled(flag)
     return {"ok": True, "enabled": flag}
 
+
+@app.delete("/goals/{goal_id}")
+def api_goals_delete(goal_id: int):
+    """
+    Delete a goal by id. Frontend's 'Delete' button should call this.
+    """
+    # If your db has a dedicated delete helper, use it:
+    # db.goals_delete(goal_id)
+    # Otherwise, implement deletion in utils.db and call it here.
+    deleted = db.goals_delete(goal_id)  # expects True/False
+    if not deleted:
+        raise HTTPException(404, "Goal not found")
+    _history_append({"kind": "goal_delete", "id": goal_id})
+    return {"status": "ok", "goals": db.goals_list()}
+
+@app.post("/goals/dedupe")
+def api_goals_dedupe():
+    """
+    Remove duplicate goals by text (case/space-normalized), keep the oldest.
+    Frontend's 'Dedupe' button should call this.
+    """
+    # Prefer a db helper if you have one:
+    # removed = db.goals_dedupe()
+
+    # Generic fallback dedupe by text:
+    goals = db.goals_list()
+    seen = set()
+    to_delete = []
+    for g in goals:
+        key = " ".join(str(g.get("text","")).split()).lower()
+        if key in seen:
+            to_delete.append(int(g.get("id", g.get("gid", -1))))
+        else:
+            seen.add(key)
+
+    removed = 0
+    for gid in to_delete:
+        if gid is not None and gid != -1:
+            if db.goals_delete(gid):
+                removed += 1
+
+    _history_append({"kind": "goals_dedupe", "removed": removed})
+    return {"status": "ok", "removed": removed, "goals": db.goals_list()}
 # -----------------------------------------------------
 #  Goals (robust parsing)
 # -----------------------------------------------------

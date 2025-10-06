@@ -14,15 +14,17 @@ from sqlalchemy.orm import sessionmaker, declarative_base, scoped_session
 # ---------------------------------------------------------------------
 # Engine / Session
 # ---------------------------------------------------------------------
-# Prefer Postgres from env; fall back to a persistent SQLite path for local use.
 DB_PATH = os.getenv("SQLITE_PATH", os.path.join(os.path.dirname(__file__), "..", "doublehelix.db"))
 DATABASE_URL = os.getenv("DATABASE_URL", f"sqlite:///{DB_PATH}")
 
-# psycopg2 driver hint if user pasted a bare postgres URL
+# Add psycopg2 driver if a bare Postgres URL is provided
 if DATABASE_URL.startswith("postgresql://") and "+psycopg2" not in DATABASE_URL:
     DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+psycopg2://", 1)
 
-engine = create_engine(DATABASE_URL, pool_pre_ping=True)
+# For SQLite, enable multithreaded access (FastAPI + background threads)
+connect_args = {"check_same_thread": False} if DATABASE_URL.startswith("sqlite:///") else {}
+
+engine = create_engine(DATABASE_URL, pool_pre_ping=True, connect_args=connect_args)
 SessionLocal = scoped_session(sessionmaker(bind=engine, autocommit=False, autoflush=False))
 Base = declarative_base()
 
@@ -31,8 +33,13 @@ def _now_str() -> str:
     return time.strftime("%Y-%m-%d %H:%M:%S")
 
 
+def _norm_text(s: str) -> str:
+    """Normalize text for dedupe: collapse spaces + lowercase."""
+    return " ".join(str(s or "").split()).lower()
+
+
 # ---------------------------------------------------------------------
-# Models (schema-compatible with your previous tables)
+# Models
 # ---------------------------------------------------------------------
 class Fact(Base):
     __tablename__ = "facts"
@@ -66,10 +73,9 @@ class Goal(Base):
 
 
 # ---------------------------------------------------------------------
-# Init (creates tables if missing). FTS table is removed (Postgres-safe).
+# Init
 # ---------------------------------------------------------------------
 def init():
-    # ensure local dir for SQLite if used
     if DATABASE_URL.startswith("sqlite:///"):
         os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
     Base.metadata.create_all(bind=engine)
@@ -79,7 +85,6 @@ def init():
 # Facts
 # ---------------------------------------------------------------------
 def upsert_fact(key: str, value: str, conf: float = 0.8, embedding: Optional[bytes] = None):
-    """Insert or update a fact by key (cross-DB safe)."""
     ts = _now_str()
     s = SessionLocal()
     try:
@@ -102,7 +107,6 @@ def upsert_fact(key: str, value: str, conf: float = 0.8, embedding: Optional[byt
 
 
 def reindex_fts():
-    """No-op now (used to rebuild SQLite FTS). Kept for compatibility."""
     return None
 
 
@@ -137,17 +141,16 @@ def top_facts(limit: int = 5) -> List[Dict[str, Any]]:
 
 def search_facts(query: str, limit: int = 5) -> List[Dict[str, Any]]:
     """
-    Portable search that works on both Postgres and SQLite.
-    - Postgres: ILIKE (case-insensitive)
-    - SQLite: LIKE (case-insensitive-ish by default for ASCII)
+    Portable search for both Postgres and SQLite.
+    Matches in value OR key (useful for 'principle:' etc.).
     """
     s = SessionLocal()
     try:
         pattern = f"%{query}%"
         if DATABASE_URL.startswith("postgresql"):
-            filt = Fact.value.ilike(pattern)  # Postgres ILIKE
+            filt = (Fact.value.ilike(pattern) | Fact.key.ilike(pattern))
         else:
-            filt = Fact.value.like(pattern)
+            filt = (Fact.value.like(pattern) | Fact.key.like(pattern))
         rows = s.execute(select(Fact).where(filt).order_by(Fact.ts.desc()).limit(limit)).scalars().all()
         return [{"key": r.key, "value": r.value, "confidence": r.confidence, "ts": r.ts} for r in rows]
     finally:
@@ -193,7 +196,7 @@ def get_policy_history(last: int = 20) -> List[Dict[str, Any]]:
                 hist.append(json.loads(r.vector))
             except Exception:
                 hist.append({})
-        return hist[::-1]  # oldest first
+        return hist[::-1]
     finally:
         s.close()
 
@@ -263,7 +266,6 @@ def goals_add(text: str) -> int:
 def goals_activate(goal_id: int):
     s = SessionLocal()
     try:
-        # Deactivate all, then activate the chosen one.
         s.execute(update(Goal).values(active=False))
         s.execute(update(Goal).where(Goal.id == goal_id).values(active=True))
         s.commit()
@@ -281,5 +283,57 @@ def goal_active() -> Optional[Dict[str, Any]]:
         if row:
             return {"id": row.id, "text": row.text, "ts": row.ts}
         return None
+    finally:
+        s.close()
+
+
+def goals_delete(goal_id: int) -> bool:
+    """
+    Delete a goal by id. Returns True if a row was removed.
+    """
+    s = SessionLocal()
+    try:
+        obj = s.get(Goal, goal_id)
+        if not obj:
+            return False
+        s.delete(obj)
+        s.commit()
+        return True
+    except Exception:
+        s.rollback()
+        raise
+    finally:
+        s.close()
+
+
+def goals_dedupe() -> int:
+    """
+    Remove duplicate goals by normalized text, keeping the oldest entry.
+    Returns the number of rows deleted.
+    """
+    s = SessionLocal()
+    try:
+        rows = s.execute(select(Goal).order_by(Goal.id.asc())).scalars().all()  # oldest first
+        seen: Dict[str, int] = {}
+        to_delete: List[int] = []
+        for g in rows:
+            key = _norm_text(g.text)
+            if key in seen:
+                to_delete.append(g.id)
+            else:
+                seen[key] = g.id
+
+        removed = 0
+        if to_delete:
+            for gid in to_delete:
+                obj = s.get(Goal, gid)
+                if obj:
+                    s.delete(obj)
+                    removed += 1
+            s.commit()
+        return removed
+    except Exception:
+        s.rollback()
+        raise
     finally:
         s.close()
