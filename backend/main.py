@@ -1,4 +1,6 @@
 import os, time, json, re, threading
+import urllib.parse
+import urllib.request
 from typing import List, Dict, Any, Optional, Tuple
 
 from fastapi import FastAPI, HTTPException, Body, Request, Query
@@ -409,28 +411,92 @@ def perturb_policy(vec: Dict[str, float], profile: str) -> Dict[str, float]:
 # -----------------------------------------------------
 #  Tool layer
 # -----------------------------------------------------
-def _maybe_tool_call(text: str):
-    try:
-        obj = json.loads(text)
-        if isinstance(obj, dict) and "tool" in obj and "tool_input" in obj:
-            return True, obj
-    except Exception:
-        pass
-    return False, {}
-
 def _run_tool(obj: Dict[str, Any]) -> str:
-    tool, arg = obj.get("tool"), str(obj.get("tool_input",""))
+    tool, arg = obj.get("tool"), str(obj.get("tool_input", "")).strip()
+
+    # -----------------------------
+    # Calculator (safer + NL/date guard)
+    # -----------------------------
     if tool == "calculator":
+        # Ignore natural language or date-like inputs so we don't hijack simple questions
+        #  - Any letters? → not math.
+        #  - ISO/date-ish strings (YYYY-MM-DD or things with ":" time) → not math.
+        if re.search(r"[A-Za-z]", arg) or re.fullmatch(r"\s*\d{4}\s*-\s*\d{2}\s*-\s*\d{2}\s*", arg) or (":" in arg and re.search(r"\d", arg)):
+            return "calc_error: natural language or date input ignored"
+
         try:
+            # Strictly allow digits and math ops only
             if re.fullmatch(r"[0-9\s+\-*/().]+", arg):
-                return str(eval(arg, {"__builtins__":{}}))
+                return str(eval(arg, {"__builtins__": {}}))
         except Exception as e:
             return f"calc_error: {e}"
         return "calc_error: invalid input"
+
+    # -----------------------------
+    # Memory search (unchanged)
+    # -----------------------------
     if tool == "memory_search":
         return json.dumps({"memory_hits": db.search_facts(arg, limit=5)})
+
+    # -----------------------------
+    # Web search (DuckDuckGo Instant Answer API)
+    # -----------------------------
     if tool == "web_search":
-        return "web_search not available in DRY_RUN"
+        # Respect DRY_RUN flag to avoid outbound calls in certain environments
+        if DRY_RUN:
+            return "web_search disabled (DRY_RUN)"
+
+        try:
+            # Use DuckDuckGo's no-auth Instant Answer endpoint
+            q = urllib.parse.quote(arg)
+            url = f"https://api.duckduckgo.com/?q={q}&format=json&no_html=1&skip_disambig=1"
+            with urllib.request.urlopen(url, timeout=6) as r:
+                data = json.loads(r.read().decode("utf-8", errors="ignore"))
+
+            results = []
+
+            # Prefer Abstract if present
+            abstract = (data.get("AbstractText") or "").strip()
+            if abstract:
+                results.append({
+                    "title": data.get("Heading") or "Summary",
+                    "url": data.get("AbstractURL") or "",
+                    "snippet": abstract
+                })
+
+            # Pull a few RelatedTopics items
+            related = data.get("RelatedTopics") or []
+            for item in related:
+                # Some items are nested with a 'Topics' list
+                if "Topics" in item and isinstance(item["Topics"], list):
+                    for t in item["Topics"]:
+                        if "FirstURL" in t or "Text" in t:
+                            results.append({
+                                "title": (t.get("Text") or "").split(" - ")[0][:120],
+                                "url": t.get("FirstURL") or "",
+                                "snippet": (t.get("Text") or "")[:280]
+                            })
+                else:
+                    if "FirstURL" in item or "Text" in item:
+                        results.append({
+                            "title": (item.get("Text") or "").split(" - ")[0][:120],
+                            "url": item.get("FirstURL") or "",
+                            "snippet": (item.get("Text") or "")[:280]
+                        })
+
+            # Fall back if nothing meaningful
+            if not results:
+                results = [{"title": "No results", "url": "", "snippet": ""}]
+
+            # Trim to a small, useful batch
+            return json.dumps({"results": results[:5]})
+
+        except Exception as e:
+            return f"web_search_error: {e}"
+
+    # -----------------------------
+    # Unknown tool
+    # -----------------------------
     return f"unknown_tool: {tool}"
 
 # -----------------------------------------------------
