@@ -7,3 +7,4 @@ httpx==0.27.2
 # --- new for PostgreSQL + SQLAlchemy ---
 SQLAlchemy>=2.0
 psycopg2-binary
+openai>=2.1.0
