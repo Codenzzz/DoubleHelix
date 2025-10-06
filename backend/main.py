@@ -411,6 +411,21 @@ def perturb_policy(vec: Dict[str, float], profile: str) -> Dict[str, float]:
 # -----------------------------------------------------
 #  Tool layer
 # -----------------------------------------------------
+# -----------------------------------------------------
+#  Tool call detector (needed by chat loop)
+# -----------------------------------------------------
+def _maybe_tool_call(text: str):
+    """Return (is_tool_call, obj) if text is like:
+       {"tool": "...", "tool_input": "..."}
+    """
+    try:
+        obj = json.loads(text)
+        if isinstance(obj, dict) and "tool" in obj and "tool_input" in obj:
+            return True, obj
+    except Exception:
+        pass
+    return False, {}
+
 def _run_tool(obj: Dict[str, Any]) -> str:
     tool, arg = obj.get("tool"), str(obj.get("tool_input", "")).strip()
 
@@ -512,6 +527,19 @@ def chat(p: ChatPayload):
     try:
         _maybe_rate_limit(max(50, len(p.prompt)//3))
 
+        # === NEW: Direct tool execution if user sends JSON ===
+        try:
+            _as_json = json.loads(p.prompt)
+            if isinstance(_as_json, dict) and "tool" in _as_json and "tool_input" in _as_json:
+                tool_result = _run_tool(_as_json)
+                return {
+                    "reply": f"(Tool {_as_json['tool']} -> {tool_result})",
+                    "meta": {"handled": "direct_tool_call"}
+                }
+        except Exception:
+            pass
+        # === end NEW ===
+
         # ----- Command pre-handler (bypass model) -----
         cmd = p.prompt.strip()
 
@@ -547,7 +575,7 @@ def chat(p: ChatPayload):
         # ✅ Persistent Continuity Bridge (recent chats + emergent)
         continuity = mem_bridge(p.prompt)
 
-        # Final context (order matters: goal → runtime bridge → persistent bridge → fact snippets)
+        # Final context (order matters)
         context = goal_prefix + bridge + (continuity or "") + _context_from_memory(p.prompt, k=5)
 
         outs = []
@@ -564,7 +592,7 @@ def chat(p: ChatPayload):
 
         processed = []
         for o in outs:
-            text = o.get("content","")
+            text = o.get("content", "")
             is_tool, obj = _maybe_tool_call(text)
             if is_tool:
                 text = f"(Tool {obj['tool']} -> {_run_tool(obj)})"
@@ -581,24 +609,24 @@ def chat(p: ChatPayload):
 
         best_score, best_text, best_subs = scored[0]
 
-        # policy nudge & persist
+        # Policy nudge & persist
         vec = _policy_nudge(vec, best_subs, 0.06)
         db.set_policy_vector(vec)
 
-        # metrics + surprise tracking
+        # Metrics + surprise tracking
         metrics = db.kv_get("metrics") or {}
         prev_total = int(metrics.get("total_replies", 0))
-        new_total  = prev_total + 1
-        prev_avg   = float(metrics.get("avg_reply_score", 0.0))
-        metrics["total_replies"]  = new_total
+        new_total = prev_total + 1
+        prev_avg = float(metrics.get("avg_reply_score", 0.0))
+        metrics["total_replies"] = new_total
         metrics["avg_reply_score"] = round((prev_avg * prev_total + best_score) / new_total, 3)
         db.kv_upsert("metrics", metrics)
 
-        # Surprise proxy = novelty/creativity subscore
+        # Surprise proxy
         surprise = float(best_subs.get("creativity", 0.0))
         db.kv_upsert("last.surprise", {"value": surprise})
 
-        # history log
+        # History
         _history_append({
             "kind": "chat",
             "prompt": p.prompt,
@@ -612,7 +640,7 @@ def chat(p: ChatPayload):
             "surprise": surprise
         })
 
-        # ✅ Persist this chat turn to memory (non-blocking / best-effort)
+        # ✅ Persist this chat turn to memory
         try:
             mem_save(
                 p.prompt,
@@ -642,6 +670,7 @@ def chat(p: ChatPayload):
 
     except Exception as e:
         return {"reply": f"[server_error] {type(e).__name__}: {e}", "meta": {"error": True}}
+
 
 # -----------------------------------------------------
 #  Planner / Tick
