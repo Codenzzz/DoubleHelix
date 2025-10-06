@@ -784,21 +784,36 @@ def chat(p: ChatPayload):
     except Exception as e:
         return {"reply": f"[server_error] {type(e).__name__}: {e}", "meta": {"error": True}}
 # -----------------------------------------------------
-#  Memory awareness helper
+#  Memory awareness helper (fixed)
 # -----------------------------------------------------
 def _is_memory_awareness_query(text: str) -> bool:
+    """
+    Detect short, direct questions explicitly asking about Helix's memory state.
+    Avoid triggering on analytical or multi-part prompts that merely mention
+    'memory' or 'chat' in a broader context.
+    """
     t = (text or "").lower().strip()
     if not t:
         return False
-    has_memory_word = any(w in t for w in (
-        "remember", "memory", "persist", "save", "store", "history", "remembering"
-    ))
-    has_convo_word = any(w in t for w in (
-        "chat", "chats", "conversation", "conversations", "messages", "previous", "prior", "before"
-    ))
-    # avoid clashing with the explicit status command
-    not_explicit_cmd = not re.fullmatch(r"/memory\s+status", t)
-    return has_memory_word and has_convo_word and not_explicit_cmd
+
+    # Ignore long or complex prompts (more than ~10 words)
+    if len(t.split()) > 10:
+        return False
+
+    # Explicit short patterns only
+    patterns = [
+        r"^can\s+you\s+remember",
+        r"^do\s+you\s+remember",
+        r"^what('?s| is)\s+your\s+memory",
+        r"^tell\s+me\s+(your\s+)?memory\s+status",
+        r"^how\s+many\s+chats\s+do\s+you\s+remember",
+        r"^do\s+you\s+retain\s+memory",
+        r"^are\s+you\s+able\s+to\s+remember",
+    ]
+    for p in patterns:
+        if re.search(p, t):
+            return True
+    return False
 
 # -----------------------------------------------------
 #  Planner / Tick
