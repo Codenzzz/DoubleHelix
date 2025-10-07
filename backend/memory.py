@@ -20,13 +20,14 @@ CONF_DEFAULT   = float(os.getenv("MEMORY_CONFIDENCE", "0.7"))
 ENV_ENABLED    = os.getenv("PERSIST_CHAT", "true").strip().lower() in {"1","true","yes","on"}
 
 # KV keys
-KV_ENABLED = "memory.enabled"     # {"value": bool, "ts": "..."}
-KV_RECENT  = "memory.recent"      # {"items": [...], "n": int, "ts": "..."}
-KV_STATS   = "memory.stats"       # {"turns": int, ...}
-KV_MARKERS = "memory.markers"     # {"counts": {marker:int}, "last_seen": {marker:ts}}
-KV_TOPIC   = "thread.topic"       # {"value": "topic", "ts": "..."}
+KV_ENABLED = "memory.enabled"
+KV_RECENT  = "memory.recent"
+KV_STATS   = "memory.stats"
+KV_MARKERS = "memory.markers"
+KV_TOPIC   = "thread.topic"
+KV_CLOCK   = "memory.clock"   # temporal continuity key
 
-# Reflection/continuity markers to watch for (helps measure “self-description” maturity)
+# Reflection/continuity markers
 REFLECTION_MARKERS = [
     r"\billusion of continuity\b",
     r"\bsimulate(?:s|d)? continuity\b",
@@ -56,7 +57,6 @@ def _fingerprint(*parts: str, size: int = 10) -> str:
     return h[:size]
 
 def _asciify(s: str) -> str:
-    """Make output prompt-safe on finicky terminals/editors."""
     if not s:
         return ""
     repl = {
@@ -81,6 +81,44 @@ def _regex_any(patterns: List[str], text: str) -> List[str]:
     return hits
 
 # -----------------------------
+# Temporal awareness layer
+# -----------------------------
+def update_clock(event: str = "tick") -> Dict[str, Any]:
+    """Record a temporal 'heartbeat' and compute Δt since last one."""
+    now_ts = _now_ts()
+    clock = db.kv_get(KV_CLOCK) or {"history": []}
+    hist = list(clock.get("history", []))
+
+    last_ts = hist[-1]["ts"] if hist else None
+    delta_sec = None
+    if last_ts:
+        try:
+            t1 = time.mktime(time.strptime(last_ts, "%Y-%m-%d %H:%M:%S"))
+            t2 = time.mktime(time.strptime(now_ts, "%Y-%m-%d %H:%M:%S"))
+            delta_sec = round(t2 - t1, 2)
+        except Exception:
+            delta_sec = None
+
+    hist.append({"ts": now_ts, "event": event, "delta_sec": delta_sec})
+    hist = hist[-50:]
+
+    db.kv_upsert(KV_CLOCK, {"history": hist, "last_event": event, "last_ts": now_ts, "delta_sec": delta_sec})
+    return {"now": now_ts, "delta_sec": delta_sec, "event": event}
+
+def get_clock() -> Dict[str, Any]:
+    clock = db.kv_get(KV_CLOCK) or {}
+    hist = clock.get("history", [])
+    if hist:
+        last = hist[-1]
+        return {
+            "last_event": last.get("event"),
+            "last_ts": last.get("ts"),
+            "delta_sec": last.get("delta_sec"),
+            "history_len": len(hist)
+        }
+    return {"last_event": None, "delta_sec": None, "history_len": 0}
+
+# -----------------------------
 # Public: quick read helpers
 # -----------------------------
 def recent_turns(n: int = 5) -> List[Dict[str, Any]]:
@@ -95,6 +133,7 @@ def export_state() -> Dict[str, Any]:
         "recent": db.kv_get(KV_RECENT) or {},
         "markers": db.kv_get(KV_MARKERS) or {},
         "topic": db.kv_get(KV_TOPIC) or {},
+        "clock": get_clock(),  # ← new temporal data
     }
 
 def set_enabled(flag: bool):
@@ -104,16 +143,6 @@ def set_enabled(flag: bool):
 # Write path
 # -----------------------------
 def save_chat_turn(prompt: str, reply: str, meta: Optional[Dict[str,Any]] = None) -> None:
-    """
-    Persist a compact, queryable record of this chat turn using the existing Facts table.
-    Key:   chat:YYYYMMDD:<short_hash>
-    Value: JSON blob with prompt/response/meta/policy snapshot
-    Also updates:
-      - rolling recent KV window
-      - coarse stats (turn count, surprise histogram)
-      - marker counts (continuity/reflection terms)
-      - thread.topic (cheap heuristic)
-    """
     if not _is_enabled():
         return
 
@@ -121,6 +150,9 @@ def save_chat_turn(prompt: str, reply: str, meta: Optional[Dict[str,Any]] = None
     reply  = (reply  or "").strip()
     if not prompt or not reply or reply.startswith("[server_error]"):
         return
+
+    # heartbeat
+    update_clock(event="chat_turn")
 
     date     = _yyyymmdd()
     policy   = (meta or {}).get("policy", {})
@@ -146,7 +178,6 @@ def save_chat_turn(prompt: str, reply: str, meta: Optional[Dict[str,Any]] = None
     key = f"{CHAT_NS}:{date}:{fid}"
     db.upsert_fact(key, json.dumps(record, ensure_ascii=False), CONF_DEFAULT)
 
-    # rolling window in KV
     recent = db.kv_get(KV_RECENT) or {"items": []}
     items: List[Dict[str,Any]] = list(recent.get("items", []))
     items.append({
@@ -161,7 +192,6 @@ def save_chat_turn(prompt: str, reply: str, meta: Optional[Dict[str,Any]] = None
         items = items[-MAX_RECENT:]
     db.kv_upsert(KV_RECENT, {"items": items, "n": len(items), "ts": _now_ts()})
 
-    # coarse stats
     stats = db.kv_get(KV_STATS) or {"turns": 0}
     stats["turns"] = int(stats.get("turns", 0)) + 1
     if surprise is not None:
@@ -171,14 +201,13 @@ def save_chat_turn(prompt: str, reply: str, meta: Optional[Dict[str,Any]] = None
         stats["avg_surprise"]  = round(sum(stats["surprise_hist"]) / len(stats["surprise_hist"]), 3)
     db.kv_upsert(KV_STATS, stats)
 
-    # marker tracking (reflection / continuity language)
     _update_markers(reply)
-
-    # opportunistic topic extraction (cheap heuristic; safe to co-exist with chat.py)
     _maybe_update_topic(reply)
-
     _maybe_prune()
 
+# -----------------------------
+# Marker + Topic tracking
+# -----------------------------
 def _update_markers(text: str):
     try:
         hits = _regex_any(REFLECTION_MARKERS, text or "")
@@ -192,7 +221,6 @@ def _update_markers(text: str):
             last_seen[pat] = _now_ts()
         mk["counts"] = counts
         mk["last_seen"] = last_seen
-        # derived summary: total continuity/illusion mentions
         mk["totals"] = {
             "continuity": sum(counts.get(p, 0) for p in REFLECTION_MARKERS if "continuity" in p),
             "memory": sum(counts.get(p, 0) for p in REFLECTION_MARKERS if "memory" in p),
@@ -203,10 +231,6 @@ def _update_markers(text: str):
         pass
 
 def _maybe_update_topic(reply: str):
-    """
-    Grab a lightweight topic string from a reply (very cheap heuristic).
-    Examples: 'persistent memory', 'reality bridge', 'policy vector', 'goals', 'illusion'
-    """
     if not reply:
         return
     m = re.search(r"(persistent memory|long[- ]?term memory|reality bridge|continuity|policy(?: vector)?|emergent principle|clean eyes|goal[s]?)",
@@ -216,14 +240,12 @@ def _maybe_update_topic(reply: str):
         db.kv_upsert(KV_TOPIC, {"value": topic, "ts": _now_ts()})
 
 def _maybe_prune():
-    """Soft-prune oldest chat facts by lowering confidence so your existing prune can drop them."""
     try:
         all_f = db.all_facts()
         chat_keys = [f for f in all_f if str(f.get("key","")).startswith(f"{CHAT_NS}:")]
         if len(chat_keys) <= MAX_FACTS:
             return
         overflow = len(chat_keys) - MAX_FACTS
-        # Oldest first by ts
         for f in sorted(chat_keys, key=lambda r: r.get("ts",""))[:overflow]:
             try:
                 db.upsert_fact(f["key"], f["value"], conf=0.05)
@@ -236,31 +258,24 @@ def _maybe_prune():
 # Read / Bridge path
 # -----------------------------
 def bridge_context(prompt: str, limit_principles: int = 3, limit_recent: int = 4) -> str:
-    """
-    Build a compact continuity string for the LLM:
-      - Active goal
-      - Current topic (if any)
-      - Recent emergent principles
-      - Illusion loop (last dream/recall) if present
-      - Recent chat snapshots
-      - Tiny stats: avg_surprise (helps self-calibration)
-    """
     if not _is_enabled():
         return ""
 
     parts: List[str] = []
 
-    # Active goal
     active = db.goal_active()
     if active and active.get("text"):
         parts.append("Active goal: " + _asciify(active["text"].strip()))
 
-    # Current topic (from KV)
     topic = db.kv_get(KV_TOPIC) or {}
     if topic.get("value"):
         parts.append("Current topic: " + _asciify(str(topic["value"])))
 
-    # Emergent principles (highest confidence / newest)
+    # Temporal awareness snippet
+    clock = get_clock()
+    if clock.get("delta_sec") is not None:
+        parts.append(f"Time since last memory event: {clock['delta_sec']}s")
+
     emergent = [f for f in db.all_facts() if str(f.get("key","")).startswith("emergent:")]
     emergent.sort(key=lambda r: (float(r.get("confidence", 0.0)), r.get("ts","")), reverse=True)
     emergent = emergent[:max(0, int(limit_principles))]
@@ -269,7 +284,6 @@ def bridge_context(prompt: str, limit_principles: int = 3, limit_recent: int = 4
         for e in emergent:
             parts.append("- " + _asciify(str(e.get("value",""))))
 
-    # Illusion loop (optional hints)
     dream  = (db.kv_get("illusion.last_dream")  or {}).get("value")
     recall = (db.kv_get("illusion.last_recall") or {}).get("value")
     if dream or recall:
@@ -277,12 +291,10 @@ def bridge_context(prompt: str, limit_principles: int = 3, limit_recent: int = 4
         if dream:  parts.append("- dream: "  + _asciify(str(dream)))
         if recall: parts.append("- recall: " + _asciify(str(recall)))
 
-    # Tiny stats (signals trend w/o overfitting tokens)
     stats = db.kv_get(KV_STATS) or {}
     if "avg_surprise" in stats:
         parts.append(f"Avg surprise (recent): {stats.get('avg_surprise')}")
 
-    # Recent chat (rolling KV)
     recent = db.kv_get(KV_RECENT) or {}
     items = list(recent.get("items", []))[-max(0, int(limit_recent)):]
     if items:
@@ -296,5 +308,4 @@ def bridge_context(prompt: str, limit_principles: int = 3, limit_recent: int = 4
         return ""
 
     bridge = "Continuity Bridge:\n" + "\n".join(parts) + "\n\n"
-    # fit a conservative budget
     return bridge[:1400]
