@@ -133,11 +133,34 @@ def export_state() -> Dict[str, Any]:
         "recent": db.kv_get(KV_RECENT) or {},
         "markers": db.kv_get(KV_MARKERS) or {},
         "topic": db.kv_get(KV_TOPIC) or {},
-        "clock": get_clock(),  # ← new temporal data
+        "clock": get_clock(),  # ← temporal data
     }
 
 def set_enabled(flag: bool):
     db.kv_upsert(KV_ENABLED, {"value": bool(flag), "ts": _now_ts()})
+
+# QoL: external callers can toggle + get final status in one call
+def enable(flag: bool) -> Dict[str, Any]:
+    set_enabled(flag)
+    return status()
+
+# QoL: report real-time memory status (use in /memory/status)
+def status() -> Dict[str, Any]:
+    enabled = _is_enabled()
+    facts = db.all_facts()
+    latest = sorted(facts, key=lambda x: x.get("ts",""))[-5:] if facts else []
+    recent_kv = db.kv_get(KV_RECENT) or {}
+    stats = db.kv_get(KV_STATS) or {}
+    clock = get_clock()
+    return {
+        "enabled": enabled,
+        "total_facts": len(facts),
+        "latest": [{"key": f.get("key"), "value": f.get("value"), "confidence": f.get("confidence", 0.0)} for f in latest],
+        "recent_window": int(recent_kv.get("n", 0)),
+        "turns": int(stats.get("turns", 0)),
+        "avg_surprise": stats.get("avg_surprise"),
+        "clock": clock,
+    }
 
 # -----------------------------
 # Write path
@@ -154,13 +177,13 @@ def save_chat_turn(prompt: str, reply: str, meta: Optional[Dict[str,Any]] = None
     # heartbeat
     update_clock(event="chat_turn")
 
-    date     = _yyyymmdd()
-    policy   = (meta or {}).get("policy", {})
-    score    = (meta or {}).get("score")
-    surprise = (meta or {}).get("surprise")
-    profiles = (meta or {}).get("profiles", [])
-    normalized = (meta or {}).get("normalized")
-    intent     = (meta or {}).get("intent")
+    date      = _yyyymmdd()
+    policy    = (meta or {}).get("policy", {})
+    score     = (meta or {}).get("score")
+    surprise  = (meta or {}).get("surprise")
+    profiles  = (meta or {}).get("profiles", [])
+    normalized= (meta or {}).get("normalized")
+    intent    = (meta or {}).get("intent")
 
     record = {
         "ts": _now_ts(),
@@ -240,6 +263,7 @@ def _maybe_update_topic(reply: str):
         db.kv_upsert(KV_TOPIC, {"value": topic, "ts": _now_ts()})
 
 def _maybe_prune():
+    """Lower confidence on oldest chat facts when exceeding MAX_FACTS."""
     try:
         all_f = db.all_facts()
         chat_keys = [f for f in all_f if str(f.get("key","")).startswith(f"{CHAT_NS}:")]
@@ -248,7 +272,8 @@ def _maybe_prune():
         overflow = len(chat_keys) - MAX_FACTS
         for f in sorted(chat_keys, key=lambda r: r.get("ts",""))[:overflow]:
             try:
-                db.upsert_fact(f["key"], f["value"], conf=0.05)
+                # IMPORTANT: use positional arg for confidence; some db helpers don't accept 'conf='
+                db.upsert_fact(f["key"], f["value"], 0.05)
             except Exception:
                 pass
     except Exception:

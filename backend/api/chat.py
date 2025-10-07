@@ -1,5 +1,5 @@
 # api/chat.py
-import os, time, json, re, urllib.parse, urllib.request
+import os, time, json, re, urllib.parse, urllib.request, asyncio
 from typing import List, Dict, Any, Optional, Tuple
 
 from fastapi import APIRouter, HTTPException
@@ -24,7 +24,7 @@ from memory import (
 router = APIRouter(prefix="", tags=["chat"])  # we expose /chat at root
 
 # -----------------------------------------------------
-#  Local rate limiting (chat-only)
+#  Local rate limiting (chat-only, process-local)
 # -----------------------------------------------------
 REQUESTS_PER_MIN = int(os.getenv("REQUESTS_PER_MIN", "20"))
 TOKENS_PER_MIN   = int(os.getenv("TOKENS_PER_MIN", "12000"))
@@ -35,36 +35,42 @@ DRY_RUN          = os.getenv("DRY_RUN", "true").lower() == "true"
 _window_start = time.time()
 _req_count = 0
 _token_count = 0
+_rl_lock = asyncio.Lock()
 
-def _maybe_rate_limit(tokens_estimate: int = 0):
+async def _maybe_rate_limit(tokens_estimate: int = 0):
     global _window_start, _req_count, _token_count
-    now = time.time()
-    if now - _window_start >= 60:
-        _window_start = now
-        _req_count = 0
-        _token_count = 0
-    if _req_count + 1 > REQUESTS_PER_MIN:
-        raise HTTPException(429, "Request rate limit reached")
-    if _token_count + tokens_estimate > TOKENS_PER_MIN:
-        raise HTTPException(429, "Token rate limit reached")
-    _req_count += 1
-    _token_count += tokens_estimate
+    async with _rl_lock:
+        now = time.time()
+        if now - _window_start >= 60:
+            _window_start = now
+            _req_count = 0
+            _token_count = 0
+        if _req_count + 1 > REQUESTS_PER_MIN:
+            raise HTTPException(429, "Request rate limit reached")
+        if _token_count + tokens_estimate > TOKENS_PER_MIN:
+            raise HTTPException(429, "Token rate limit reached")
+        _req_count += 1
+        _token_count += max(0, int(tokens_estimate))
 
 # -----------------------------------------------------
 #  Tiny HTTP + DDG helpers (scoped to chat tools)
 # -----------------------------------------------------
 USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
 
-def _http_get(url: str, timeout: int = 12) -> bytes:
+def _http_get_blocking(url: str, timeout: int = 12) -> bytes:
     req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT, "Accept": "*/*"})
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return r.read()
 
-def _ddg_html_results(query: str, limit: int = 5) -> List[Dict[str, str]]:
+async def _http_get(url: str, timeout: int = 12) -> bytes:
+    # offload blocking urllib to a thread so we don't block the event loop
+    return await asyncio.to_thread(_http_get_blocking, url, timeout)
+
+async def _ddg_html_results(query: str, limit: int = 5) -> List[Dict[str, str]]:
     try:
         q = urllib.parse.quote(query)
         url = f"https://duckduckgo.com/html/?q={q}"
-        html = _http_get(url, timeout=12).decode("utf-8", errors="ignore")
+        html = (await _http_get(url, timeout=12)).decode("utf-8", errors="ignore")
         items: List[Dict[str, str]] = []
         for m in re.finditer(r'<a[^>]+class="[^"]*result__a[^"]*"[^>]*href="([^"]+)"[^>]*>(.*?)</a>', html, flags=re.I | re.S):
             href = m.group(1)
@@ -116,7 +122,6 @@ def _last_chosen_text() -> str:
 
 # -----------------------------------------------------
 #  Style + context (chat-scoped)
-#     (includes smarter memory gating)
 # -----------------------------------------------------
 def _context_from_memory(prompt: str, k: int = 5) -> str:
     # fetch more candidates then filter by lexical overlap with prompt
@@ -195,7 +200,7 @@ def _maybe_tool_call(text: str):
         pass
     return False, {}
 
-def _run_tool(obj: Dict[str, Any]) -> str:
+async def _run_tool(obj: Dict[str, Any]) -> str:
     tool, arg = obj.get("tool"), str(obj.get("tool_input", "")).strip()
 
     # Calculator
@@ -229,7 +234,8 @@ def _run_tool(obj: Dict[str, Any]) -> str:
             q = urllib.parse.quote(query)
             url = f"https://api.duckduckgo.com/?q={q}&format=json&no_html=1&skip_disambig=1"
             try:
-                data = json.loads(_http_get(url, timeout=12).decode("utf-8", errors="ignore"))
+                data_raw = await _http_get(url, timeout=12)
+                data = json.loads(data_raw.decode("utf-8", errors="ignore"))
             except Exception:
                 data = {}
 
@@ -262,7 +268,7 @@ def _run_tool(obj: Dict[str, Any]) -> str:
                     })
 
             if not results:
-                results = _ddg_html_results(query, limit=5)
+                results = await _ddg_html_results(query, limit=5)
 
             if not results:
                 results = [{"title": "No results", "url": "", "snippet": ""}]
@@ -289,16 +295,12 @@ def _run_tool(obj: Dict[str, Any]) -> str:
 #  Memory-awareness query detector (chat-scoped)
 # -----------------------------------------------------
 def _is_memory_awareness_query(text: str) -> bool:
-    """
-    Detect short, direct questions about Helix's memory capabilities/status.
-    Covers 'remember' as well as 'have persistent/long-term memory' (incl. common misspelling).
-    """
     t = (text or "").lower().strip()
     if not t:
         return False
     if len(t.split()) > 16:
         return False
-    t = t.replace("persistant", "persistent")  # normalize common misspelling
+    t = t.replace("persistant", "persistent")
     if (
         "persistent memory" in t
         or "long term memory" in t
@@ -355,10 +357,6 @@ def classify_intent(text: str) -> str:
     return "chat"
 
 def resolve_referent(prompt: str, last_reply: str) -> str:
-    """
-    Replace vague referents ('it/this/that') with inferred topic from last reply.
-    Cheap heuristic: look for known nouns; fall back to 'the previous topic'.
-    """
     p = (prompt or "").strip()
     low = p.lower()
     if re.fullmatch(r"(is|was)\s+it\s+(helpful|working|good|useful)\??", low):
@@ -376,16 +374,34 @@ class ChatPayload(BaseModel):
     model: Optional[str] = None
     use_perspectives: bool = False
 
-@router.post("/chat")
-def chat(p: ChatPayload):
+async def _call_provider(messages: List[Dict[str,str]], model: Optional[str], style_hint: str) -> Tuple[str, Dict[str,Any]]:
+    """
+    Standardize provider call: awaitable, returns (reply, meta).
+    """
     try:
-        _maybe_rate_limit(max(50, len(p.prompt)//3))
+        reply, meta = await complete_many(messages, model=model or "gpt-4o-mini", style_hint=style_hint)  # ← matches your other code
+        if not isinstance(meta, dict):
+            meta = {}
+        return str(reply or ""), meta
+    except TypeError:
+        # In case your provider exposes a sync signature in some envs
+        out = complete_many(messages, model=model or "gpt-4o-mini", style_hint=style_hint)
+        if isinstance(out, tuple) and len(out) == 2:
+            return str(out[0] or ""), dict(out[1] or {})
+        if isinstance(out, list) and out:
+            return str(out[0].get("content","")), {}
+        return "[model_error] unsupported provider return", {}
+
+@router.post("/chat")
+async def chat(p: ChatPayload):
+    try:
+        await _maybe_rate_limit(max(50, len(p.prompt)//3))
 
         # === JSON tool pass-through ===
         try:
             _as_json = json.loads(p.prompt)
             if isinstance(_as_json, dict) and "tool" in _as_json and "tool_input" in _as_json:
-                tool_result = _run_tool(_as_json)
+                tool_result = await _run_tool(_as_json)
                 return {
                     "reply": f"(Tool {_as_json['tool']} -> {tool_result})",
                     "meta": {"handled": "direct_tool_call"}
@@ -400,7 +416,7 @@ def chat(p: ChatPayload):
         m1 = re.match(r'^(?:search|web)\s+(.+)$', cmd, flags=re.I)
         if m1:
             q = m1.group(1).strip()
-            tool_result = _run_tool({"tool": "web_search", "tool_input": q})
+            tool_result = await _run_tool({"tool": "web_search", "tool_input": q})
             return {
                 "reply": f"(Tool web_search -> {tool_result})",
                 "meta": {"handled": "command_web_search", "query": q}
@@ -456,7 +472,7 @@ def chat(p: ChatPayload):
         goal_text = goal.get("text", "") if isinstance(goal, dict) else (goal or "")
         goal_prefix = f"Active goal: {goal_text}\n\n" if goal_text else ""
 
-        # Reality Bridge: goal + anchors from facts (local copy)
+        # Reality Bridge (local)
         def _bridge_context_local(k_goal: int = 1, k_facts: int = 7, k_emergent: int = 2) -> str:
             facts = db.top_facts(limit=20)
             facts_sorted = sorted(facts, key=lambda x: float(x.get("confidence", 0.5)), reverse=True)
@@ -505,41 +521,29 @@ def chat(p: ChatPayload):
         # Final context
         context = bias + topic_line + goal_prefix + bridge + (continuity or "") + _context_from_memory(cmd, k=5)
 
-        outs = []
-        used_profiles = []
-        try:
-            if p.use_perspectives:
-                for profile in ["base", "explorer", "skeptic", "planner"]:
-                    p_vec = perturb_policy(vec, profile) if profile != "base" else vec
-                    p_style = get_style_prompt(p_vec) + " " + style
-                    outs.extend(complete_many(context + cmd, n=1, model=p.model or "gpt-4o-mini", style_hint=p_style))
-                    used_profiles.append(profile)
-            else:
-                outs = complete_many(context + cmd, n=N_SAMPLES, model=p.model or "gpt-4o-mini", style_hint=style)
-                used_profiles.append("base")
-        except Exception as e:
-            # if the provider explodes, fail gracefully with a single candidate
-            outs = [{"content": f"[model_error] {type(e).__name__}: {e}"}]
-            used_profiles = ["base"]
+        # === Candidate generation ===
+        messages = [{"role": "user", "content": context + cmd}]
+        candidates: List[Tuple[float,str,Dict[str,float]]] = []
+        profiles_used: List[str] = []
 
-        processed = []
-        for o in outs:
-            text = o.get("content", "")
-            is_tool, obj = _maybe_tool_call(text)
-            if is_tool:
-                text = f"(Tool {obj['tool']} -> {_run_tool(obj)})"
-            processed.append(text)
+        if p.use_perspectives:
+            for profile in ["base", "explorer", "skeptic", "planner"]:
+                p_vec = perturb_policy(vec, profile) if profile != "base" else vec
+                p_style = get_style_prompt(p_vec) + " " + style
+                reply_text, meta0 = await _call_provider(messages, p.model, p_style)
+                s, subs = _score_with_policy(reply_text, memory, p_vec)
+                candidates.append((s, reply_text, subs))
+                profiles_used.append(profile)
+        else:
+            # multi-sample with same style
+            for _ in range(N_SAMPLES):
+                reply_text, meta0 = await _call_provider(messages, p.model, style)
+                s, subs = _score_with_policy(reply_text, memory, vec)
+                candidates.append((s, reply_text, subs))
+            profiles_used.append("base")
 
-        if not processed:
-            processed = ["[no_output]"]
-
-        scored = []
-        for t in processed:
-            s, subs = _score_with_policy(t, memory, vec)
-            scored.append((s, t, subs))
-        scored.sort(key=lambda x: x[0], reverse=True)
-
-        best_score, best_text, best_subs = scored[0]
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        best_score, best_text, best_subs = candidates[0]
 
         # Topic tracking: pull a lightweight topic from best_text and store it for next turn
         topic_match = re.search(r"(persistent memory|continuity|bridge|policy(?: vector)?|goals?|illusion|clean eyes)", best_text, re.I)
@@ -569,8 +573,8 @@ def chat(p: ChatPayload):
             "normalized": cmd,      # what we actually used after referent resolution
             "active_goal": goal_text,
             "used_perspectives": p.use_perspectives,
-            "profiles": used_profiles,
-            "candidates": [t for _, t, _ in scored],
+            "profiles": profiles_used,
+            "candidates": [t for _, t, _ in candidates],
             "chosen": best_text,
             "score": best_score,
             "bridge_used": bool(bridge or continuity),
@@ -586,9 +590,9 @@ def chat(p: ChatPayload):
                     "policy": vec,
                     "score": best_score,
                     "surprise": surprise,
-                    "profiles": used_profiles,
+                    "profiles": profiles_used,
                     "normalized": cmd,   # store normalized too (useful for analysis)
-                    "intent": intent
+                    "intent": classify_intent(cmd),
                 }
             )
         except Exception:
@@ -599,14 +603,16 @@ def chat(p: ChatPayload):
             "meta": {
                 "score": best_score,
                 "surprise": round(surprise, 3),
-                "candidates": len(scored),
+                "candidates": len(candidates),
                 "used_perspectives": bool(p.use_perspectives),
-                "profiles": used_profiles,
+                "profiles": profiles_used,
                 "policy": vec,
                 "bridge_used": bool(bridge or continuity),
             }
         }
 
+    except HTTPException:
+        raise
     except Exception as e:
         return {"reply": f"[server_error] {type(e).__name__}: {e}", "meta": {"error": True}}
 
