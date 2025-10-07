@@ -374,21 +374,29 @@ class ChatPayload(BaseModel):
     model: Optional[str] = None
     use_perspectives: bool = False
 
-async def _call_provider(messages: List[Dict[str,str]], model: Optional[str], style_hint: str) -> Tuple[str, Dict[str,Any]]:
+async def _call_provider(
+    messages: List[Dict[str,str]],
+    model: Optional[str],
+    style_hint: str,
+    n: int = 1
+) -> Tuple[str, Dict[str,Any]]:
     """
     Standardize provider call: awaitable, returns (reply, meta).
+    Ensures the required `n` is always passed to `complete_many`.
     """
     try:
-        reply, meta = await complete_many(messages, model=model or "gpt-4o-mini", style_hint=style_hint)  # ← matches your other code
+        reply, meta = await complete_many(messages, n=n, model=model or "gpt-4o-mini", style_hint=style_hint)
         if not isinstance(meta, dict):
             meta = {}
         return str(reply or ""), meta
     except TypeError:
         # In case your provider exposes a sync signature in some envs
-        out = complete_many(messages, model=model or "gpt-4o-mini", style_hint=style_hint)
+        out = complete_many(messages, n=n, model=model or "gpt-4o-mini", style_hint=style_hint)
+      # Accept common shapes from different provider adapters
         if isinstance(out, tuple) and len(out) == 2:
             return str(out[0] or ""), dict(out[1] or {})
         if isinstance(out, list) and out:
+            # assume list of candidates with {"content": "..."}
             return str(out[0].get("content","")), {}
         return "[model_error] unsupported provider return", {}
 
@@ -530,14 +538,14 @@ async def chat(p: ChatPayload):
             for profile in ["base", "explorer", "skeptic", "planner"]:
                 p_vec = perturb_policy(vec, profile) if profile != "base" else vec
                 p_style = get_style_prompt(p_vec) + " " + style
-                reply_text, meta0 = await _call_provider(messages, p.model, p_style)
+                reply_text, meta0 = await _call_provider(messages, p.model, p_style, n=1)
                 s, subs = _score_with_policy(reply_text, memory, p_vec)
                 candidates.append((s, reply_text, subs))
                 profiles_used.append(profile)
         else:
             # multi-sample with same style
             for _ in range(N_SAMPLES):
-                reply_text, meta0 = await _call_provider(messages, p.model, style)
+                reply_text, meta0 = await _call_provider(messages, p.model, style, n=1)
                 s, subs = _score_with_policy(reply_text, memory, vec)
                 candidates.append((s, reply_text, subs))
             profiles_used.append("base")
