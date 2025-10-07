@@ -108,9 +108,16 @@ def _history_append(event: Dict[str, Any]):
 
 # -----------------------------------------------------
 #  Style + context (chat-scoped)
+#     (includes smarter memory gating)
 # -----------------------------------------------------
 def _context_from_memory(prompt: str, k: int = 5) -> str:
-    relevant = db.search_facts(prompt, limit=k) or db.top_facts(limit=k)
+    # fetch more candidates then filter by lexical overlap with prompt
+    cand = db.search_facts(prompt, limit=12) or db.top_facts(limit=12)
+    pw = set(re.findall(r"[a-zA-Z]{3,}", (prompt or "").lower()))
+    def ok(f):
+        vw = set(re.findall(r"[a-zA-Z]{3,}", str(f.get('value',"")).lower()))
+        return len(pw & vw) >= 1
+    relevant = [f for f in cand if ok(f)][:k]
     lines = [f"- {r['key']}: {r['value']}" for r in relevant]
     return ("Context facts:\n" + "\n".join(lines) + "\n\n") if lines else ""
 
@@ -125,6 +132,8 @@ def _style_hint(vec: Dict[str, float]) -> str:
     prefs.append('If calculation is required, respond with JSON tool call {"tool":"calculator","tool_input":"EXPR"}.')
     prefs.append('If memory helps, respond with {"tool":"memory_search","tool_input":"query"}.')
     prefs.append('If web info helps, respond with {"tool":"web_search","tool_input":"QUERY"}.')
+    # DRY_RUN awareness
+    prefs.append('Only call tools if necessary; if web search is disabled (DRY_RUN), explain using current context instead.')
     return "Style preferences: " + "; ".join(prefs) + "."
 
 def get_style_prompt(vec: Dict[str, float]) -> str:
@@ -279,15 +288,9 @@ def _is_memory_awareness_query(text: str) -> bool:
     t = (text or "").lower().strip()
     if not t:
         return False
-
-    # keep it to short/direct questions so we don't hijack analytical prompts
     if len(t.split()) > 16:
         return False
-
-    # normalize common misspelling
-    t = t.replace("persistant", "persistent")
-
-    # quick keyword combos that imply memory capability/status questions
+    t = t.replace("persistant", "persistent")  # normalize common misspelling
     if (
         "persistent memory" in t
         or "long term memory" in t
@@ -303,8 +306,6 @@ def _is_memory_awareness_query(text: str) -> bool:
         or "chat memory" in t
     ):
         return True
-
-    # regex patterns for classic phrasing
     patterns = [
         r"^can\s+you\s+remember",
         r"^do\s+you\s+remember",
@@ -333,6 +334,31 @@ def perturb_policy(vec: Dict[str, float], profile: str) -> Dict[str, float]:
     elif profile == "planner":
         p["planning_focus"] = min(1.0, p.get("planning_focus",0)+0.3)
         p["conciseness"] = min(1.0, p.get("conciseness",0)+0.2)
+    return p
+
+# -----------------------------------------------------
+#  Lightweight intent router + referent resolver + topic tracker
+# -----------------------------------------------------
+def classify_intent(text: str) -> str:
+    t = (text or "").lower().strip()
+    if re.search(r"^\s*(is|was)\s+.+(helpful|useful|working|good)\??$", t): return "opinion"
+    if re.search(r"\b(status|enabled|how many|persistent memory|do you remember|memory)\b", t): return "status"
+    if re.search(r"^(how|what|give me|write|build|code|plan)\b", t): return "instruction"
+    return "chat"
+
+def resolve_referent(prompt: str, last_reply: str) -> str:
+    """
+    Replace vague referents ('it/this/that') with inferred topic from last reply.
+    Cheap heuristic: look for known nouns; fall back to 'the previous topic'.
+    """
+    p = (prompt or "").strip()
+    low = p.lower()
+    if re.fullmatch(r"(is|was)\s+it\s+(helpful|working|good|useful)\??", low):
+        m = re.search(r"(persistent memory|continuity|bridge|goal|policy vector|emergent principle)", last_reply or "", re.I)
+        subject = m.group(1) if m else "the previous topic"
+        # preserve the predicate (e.g., 'helpful?')
+        pred = low.split()[-1]
+        return f"Is {subject} {pred}?"
     return p
 
 # -----------------------------------------------------
@@ -373,6 +399,11 @@ def chat(p: ChatPayload):
                 "meta": {"handled": "command_web_search", "query": q}
             }
 
+        # Resolve vague referents using last assistant reply (for short follow-ups like "is it helpful")
+        history = _history_get()
+        last_reply = history[-1]["chosen"] if history else ""
+        cmd = resolve_referent(cmd, last_reply)
+
         # /memory awareness (uses memory.export_state)
         if _is_memory_awareness_query(cmd):
             st = mem_export()
@@ -398,7 +429,20 @@ def chat(p: ChatPayload):
 
         # ----- Normal model path -----
         vec = db.get_policy_vector()
+        intent = classify_intent(cmd)
+
+        # intent-conditioned style + ambiguity hint for tiny follow-ups
         style = get_style_prompt(vec)
+        style += " " + {
+            "status": "Answer with a factual status about Helix internals.",
+            "opinion": "Give a concise, first-person assessment grounded in Helix state.",
+            "instruction": "Provide a step-by-step actionable answer.",
+            "chat": "Be natural and concise.",
+        }[intent]
+        low_context = (len(cmd.split()) < 4)
+        if low_context:
+            style += " If the user question is ambiguous, say what you think 'it' refers to before answering."
+
         memory = db.top_facts(5)
 
         # Goal-aware + Continuity Bridge context
@@ -443,9 +487,17 @@ def chat(p: ChatPayload):
             return last_surprise >= bridge_s or max_var >= bridge_v
 
         bridge = _bridge_context_local() if _should_bridge_local() else ""
-        continuity = mem_bridge(p.prompt)
+        continuity = mem_bridge(cmd)
 
-        context = goal_prefix + bridge + (continuity or "") + _context_from_memory(p.prompt, k=5)
+        # Topic tracker (store after we answer; also read latest topic here)
+        thread = db.kv_get("thread.topic") or {}
+        topic_line = f"Current topic: {thread.get('value')}\n\n" if thread.get('value') else ""
+
+        # Short follow-up bias: if very short, remind the model this is about the immediately prior assistant reply
+        bias = "Follow-up question; answer about the immediately prior assistant reply.\n\n" if low_context else ""
+
+        # Final context
+        context = bias + topic_line + goal_prefix + bridge + (continuity or "") + _context_from_memory(cmd, k=5)
 
         outs = []
         used_profiles = []
@@ -453,11 +505,11 @@ def chat(p: ChatPayload):
             if p.use_perspectives:
                 for profile in ["base", "explorer", "skeptic", "planner"]:
                     p_vec = perturb_policy(vec, profile) if profile != "base" else vec
-                    p_style = get_style_prompt(p_vec)
-                    outs.extend(complete_many(context + p.prompt, n=1, model=p.model or "gpt-4o-mini", style_hint=p_style))
+                    p_style = get_style_prompt(p_vec) + " " + style
+                    outs.extend(complete_many(context + cmd, n=1, model=p.model or "gpt-4o-mini", style_hint=p_style))
                     used_profiles.append(profile)
             else:
-                outs = complete_many(context + p.prompt, n=N_SAMPLES, model=p.model or "gpt-4o-mini", style_hint=style)
+                outs = complete_many(context + cmd, n=N_SAMPLES, model=p.model or "gpt-4o-mini", style_hint=style)
                 used_profiles.append("base")
         except Exception as e:
             # if the provider explodes, fail gracefully with a single candidate
@@ -483,6 +535,11 @@ def chat(p: ChatPayload):
 
         best_score, best_text, best_subs = scored[0]
 
+        # Topic tracking: pull a lightweight topic from best_text and store it for next turn
+        topic_match = re.search(r"(persistent memory|continuity|bridge|policy(?: vector)?|goals?|illusion|clean eyes)", best_text, re.I)
+        if topic_match:
+            db.kv_upsert("thread.topic", {"value": topic_match.group(1), "ts": time.strftime("%Y-%m-%d %H:%M:%S")})
+
         # Policy nudge & persist
         vec = _policy_nudge(vec, best_subs, 0.06)
         db.set_policy_vector(vec)
@@ -502,7 +559,8 @@ def chat(p: ChatPayload):
         # History
         _history_append({
             "kind": "chat",
-            "prompt": p.prompt,
+            "prompt": p.prompt,     # keep original user text
+            "normalized": cmd,      # what we actually used after referent resolution
             "active_goal": goal_text,
             "used_perspectives": p.use_perspectives,
             "profiles": used_profiles,
@@ -516,13 +574,15 @@ def chat(p: ChatPayload):
         # ✅ Persist this chat turn to memory
         try:
             mem_save(
-                p.prompt,
+                p.prompt,            # store original prompt
                 best_text,
                 meta={
                     "policy": vec,
                     "score": best_score,
                     "surprise": surprise,
-                    "profiles": used_profiles
+                    "profiles": used_profiles,
+                    "normalized": cmd,   # store normalized too (useful for analysis)
+                    "intent": intent
                 }
             )
         except Exception:
