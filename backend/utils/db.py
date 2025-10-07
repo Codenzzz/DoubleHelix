@@ -14,16 +14,35 @@ from sqlalchemy.orm import sessionmaker, declarative_base, scoped_session
 # ---------------------------------------------------------------------
 # Engine / Session
 # ---------------------------------------------------------------------
-DB_PATH = os.getenv("SQLITE_PATH", os.path.join(os.path.dirname(__file__), "..", "doublehelix.db"))
-DATABASE_URL = os.getenv("DATABASE_URL", f"sqlite:///{DB_PATH}")
+DB_PATH = os.getenv(
+    "SQLITE_PATH",
+    os.path.join(os.path.dirname(__file__), "..", "doublehelix.db"),
+)
+DATABASE_URL = os.getenv("DATABASE_URL", f"sqlite:///{DB_PATH}").strip()
 
-# Add psycopg2 driver if a bare Postgres URL is provided
+# 1) Ensure psycopg2 driver if Postgres URL is bare
 if DATABASE_URL.startswith("postgresql://") and "+psycopg2" not in DATABASE_URL:
     DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+psycopg2://", 1)
 
-# For SQLite, enable multithreaded access (FastAPI + background threads)
+# 2) Ensure SSL for Supabase (or when POSTGRES_REQUIRE_SSL=true)
+def _ensure_ssl(url: str) -> str:
+    if not url.startswith("postgresql+psycopg2://"):
+        return url
+    must_ssl = os.getenv("POSTGRES_REQUIRE_SSL", "").lower() in ("1", "true", "yes") or ("supabase.co" in url)
+    if not must_ssl:
+        return url
+    # append sslmode=require if missing
+    if "sslmode=" not in url:
+        sep = "&" if "?" in url else "?"
+        url = f"{url}{sep}sslmode=require"
+    return url
+
+DATABASE_URL = _ensure_ssl(DATABASE_URL)
+
+# 3) Connect args: only for SQLite (FastAPI + background threads)
 connect_args = {"check_same_thread": False} if DATABASE_URL.startswith("sqlite:///") else {}
 
+# 4) Create engine (pre-ping helps with long-lived connections)
 engine = create_engine(DATABASE_URL, pool_pre_ping=True, connect_args=connect_args)
 SessionLocal = scoped_session(sessionmaker(bind=engine, autocommit=False, autoflush=False))
 Base = declarative_base()
