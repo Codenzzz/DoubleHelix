@@ -106,6 +106,14 @@ def _history_append(event: Dict[str, Any]):
         items = items[-HIST_MAX:]
     db.kv_upsert(HIST_KEY, {"items": items})
 
+def _last_chosen_text() -> str:
+    """Safely fetch the last assistant reply text (if present)."""
+    for it in reversed(_history_get()):
+        ch = it.get("chosen")
+        if isinstance(ch, str) and ch.strip():
+            return ch
+    return ""
+
 # -----------------------------------------------------
 #  Style + context (chat-scoped)
 #     (includes smarter memory gating)
@@ -356,8 +364,7 @@ def resolve_referent(prompt: str, last_reply: str) -> str:
     if re.fullmatch(r"(is|was)\s+it\s+(helpful|working|good|useful)\??", low):
         m = re.search(r"(persistent memory|continuity|bridge|goal|policy vector|emergent principle)", last_reply or "", re.I)
         subject = m.group(1) if m else "the previous topic"
-        # preserve the predicate (e.g., 'helpful?')
-        pred = low.split()[-1]
+        pred = low.split()[-1]  # e.g., 'helpful?'
         return f"Is {subject} {pred}?"
     return p
 
@@ -399,9 +406,8 @@ def chat(p: ChatPayload):
                 "meta": {"handled": "command_web_search", "query": q}
             }
 
-        # Resolve vague referents using last assistant reply (for short follow-ups like "is it helpful")
-        history = _history_get()
-        last_reply = history[-1]["chosen"] if history else ""
+        # Resolve vague referents using last assistant reply (safe)
+        last_reply = _last_chosen_text()
         cmd = resolve_referent(cmd, last_reply)
 
         # /memory awareness (uses memory.export_state)
@@ -493,7 +499,7 @@ def chat(p: ChatPayload):
         thread = db.kv_get("thread.topic") or {}
         topic_line = f"Current topic: {thread.get('value')}\n\n" if thread.get('value') else ""
 
-        # Short follow-up bias: if very short, remind the model this is about the immediately prior assistant reply
+        # Short follow-up bias
         bias = "Follow-up question; answer about the immediately prior assistant reply.\n\n" if low_context else ""
 
         # Final context
@@ -603,3 +609,14 @@ def chat(p: ChatPayload):
 
     except Exception as e:
         return {"reply": f"[server_error] {type(e).__name__}: {e}", "meta": {"error": True}}
+
+# -----------------------------------------------------
+#  Minimal history read API (for frontend)
+# -----------------------------------------------------
+@router.get("/history")
+def api_history(limit: int = 80):
+    try:
+        items = _history_get()
+        return {"history": items[-max(1, min(500, limit)):] }
+    except Exception as e:
+        raise HTTPException(500, f"history_error: {e}")
