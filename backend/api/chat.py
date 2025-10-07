@@ -298,8 +298,16 @@ def _is_memory_awareness_query(text: str) -> bool:
     t = (text or "").lower().strip()
     if not t:
         return False
+
+    # NEW: explicit diagnostics also count as memory-awareness
+    if t.startswith("memory check") or t.startswith("memory status"):
+        return True
+    if t in {"memory", "memory?", "check memory", "memory diag", "memory diagnostic"}:
+        return True
+
     if len(t.split()) > 16:
         return False
+
     t = t.replace("persistant", "persistent")
     if (
         "persistent memory" in t
@@ -392,7 +400,7 @@ async def _call_provider(
     except TypeError:
         # In case your provider exposes a sync signature in some envs
         out = complete_many(messages, n=n, model=model or "gpt-4o-mini", style_hint=style_hint)
-      # Accept common shapes from different provider adapters
+        # Accept common shapes from different provider adapters
         if isinstance(out, tuple) and len(out) == 2:
             return str(out[0] or ""), dict(out[1] or {})
         if isinstance(out, list) and out:
@@ -419,6 +427,49 @@ async def chat(p: ChatPayload):
         # === end pass-through ===
 
         cmd = p.prompt.strip()
+
+        # === Memory diagnostic command (explicit) ===
+        low = cmd.lower()
+        if low.startswith("memory check") or low.startswith("memory status") or low in {"memory", "check memory", "memory diag", "memory diagnostic"}:
+            # 1) Write a ping fact (best-effort)
+            try:
+                mem_save('memory_check', 'ping test memory', meta={"source": "diagnostic"})
+            except Exception:
+                pass
+
+            # 2) Read the last 2 facts (best-effort)
+            try:
+                recent_all = db.all_facts() or []
+                recent_all_sorted = sorted(recent_all, key=lambda x: x.get("ts",""))
+                recent_two = recent_all_sorted[-2:] if recent_all_sorted else []
+                last_two = [{"key": f.get("key"), "value": f.get("value"), "confidence": f.get("confidence", 0.0)} for f in recent_two]
+            except Exception:
+                last_two = []
+
+            # 3) Summaries
+            try:
+                total_facts = len(db.all_facts() or [])
+            except Exception:
+                total_facts = None
+
+            last_ts = time.strftime("%Y-%m-%d %H:%M:%S")
+
+            return {
+                "reply": (
+                    "✅ Memory diagnostic\n"
+                    f"- Wrote: 'ping test memory'\n"
+                    f"- Last 2 facts: {last_two}\n"
+                    f"- Total facts: {total_facts}\n"
+                    f"- last_ts: {last_ts}"
+                ),
+                "meta": {
+                    "handled": "memory_check",
+                    "total_facts": total_facts,
+                    "last_two": last_two,
+                    "last_ts": last_ts
+                }
+            }
+        # === end memory diagnostic ===
 
         # "search ..." or "web ..." -> force web_search tool
         m1 = re.match(r'^(?:search|web)\s+(.+)$', cmd, flags=re.I)
