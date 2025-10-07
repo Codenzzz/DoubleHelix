@@ -12,7 +12,7 @@ from dotenv import load_dotenv
 from providers import complete_many, reflect_json
 from utils import db
 
-# ✅ Persistent chat memory bridge + saver
+# ✅ Persistent chat memory bridge + saver (admin/export used here)
 from memory import (
     bridge_context as mem_bridge,
     save_chat_turn as mem_save,
@@ -21,11 +21,11 @@ from memory import (
 )
 
 # =====================================================
-#  DoubleHelix API — Emergent Reflection Engine (v0.9.0)
+#  DoubleHelix API — Emergent Reflection Engine (v0.9.1)
 # =====================================================
 
 load_dotenv()
-app = FastAPI(title="DoubleHelix API", version="0.9.0")
+app = FastAPI(title="DoubleHelix API", version="0.9.1")
 db.init()
 
 # -----------------------------------------------------
@@ -53,7 +53,7 @@ app.add_middleware(
 # -----------------------------------------------------
 def bootstrap_defaults():
     db.upsert_fact("system.name", "DoubleHelix", 0.95)
-    db.upsert_fact("system.version", "0.9.0", 0.9)
+    db.upsert_fact("system.version", "0.9.1", 0.9)
     db.upsert_fact("last_boot", time.strftime("%Y-%m-%d %H:%M:%S"), 0.7)
 
     if not db.kv_get("meta.births"):
@@ -95,7 +95,7 @@ N_SAMPLES        = int(os.getenv("N_SAMPLES", "3"))
 DRY_RUN          = os.getenv("DRY_RUN", "true").lower() == "true"
 
 # -----------------------------------------------------
-#  Simple HTTP helper with headers (avoids 403/blank)
+#  Simple HTTP helper with headers (used by /debug/env)
 # -----------------------------------------------------
 USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
 
@@ -103,27 +103,6 @@ def _http_get(url: str, timeout: int = 12) -> bytes:
     req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT, "Accept": "*/*"})
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return r.read()
-
-# -----------------------------------------------------
-#  Rate Limiting
-# -----------------------------------------------------
-_window_start = time.time()
-_req_count = 0
-_token_count = 0
-
-def _maybe_rate_limit(tokens_estimate: int = 0):
-    global _window_start, _req_count, _token_count
-    now = time.time()
-    if now - _window_start >= 60:
-        _window_start = now
-        _req_count = 0
-        _token_count = 0
-    if _req_count + 1 > REQUESTS_PER_MIN:
-        raise HTTPException(429, "Request rate limit reached")
-    if _token_count + tokens_estimate > TOKENS_PER_MIN:
-        raise HTTPException(429, "Token rate limit reached")
-    _req_count += 1
-    _token_count += tokens_estimate
 
 # -----------------------------------------------------
 #  History buffer (ring) via KV
@@ -148,13 +127,8 @@ def _history_append(event: Dict[str, Any]):
     db.kv_upsert(HIST_KEY, {"items": items})
 
 # -----------------------------------------------------
-#  Context + Style
+#  Context + Style (kept for non-chat features that may reuse later)
 # -----------------------------------------------------
-def _context_from_memory(prompt: str, k: int = 5) -> str:
-    relevant = db.search_facts(prompt, limit=k) or db.top_facts(limit=k)
-    lines = [f"- {r['key']}: {r['value']}" for r in relevant]
-    return ("Context facts:\n" + "\n".join(lines) + "\n\n") if lines else ""
-
 def get_style_prompt(vec: Dict[str, float]) -> str:
     evolved = db.kv_get("prompts.style_hint")
     if evolved and evolved.get("text"):
@@ -171,7 +145,6 @@ def _style_hint(vec: Dict[str, float]) -> str:
     if not prefs: prefs.append("balanced, helpful responses")
     prefs.append('If calculation is required, respond with JSON tool call {"tool":"calculator","tool_input":"EXPR"}.')
     prefs.append('If memory helps, respond with {"tool":"memory_search","tool_input":"query"}.')
-    # ✅ allow model to self-trigger web search when useful
     prefs.append('If web info helps, respond with {"tool":"web_search","tool_input":"QUERY"}.')
     return "Style preferences: " + "; ".join(prefs) + "."
 
@@ -185,38 +158,8 @@ def health():
     return {"status": "ok"}
 
 # -----------------------------------------------------
-#  Scoring + Policy
+#  Policy variance helpers (used by tick/bridge/clean eyes)
 # -----------------------------------------------------
-def _subscores(text: str, memory_text: str) -> Dict[str, float]:
-    def bag(s): return set(w.lower() for w in re.findall(r"[a-zA-Z]+", s))
-    overlap = len(bag(text) & bag(memory_text)) / (len(bag(text)) + 1e-6)
-    novelty = 1.0 - min(overlap, 1.0)
-    length = len(text)
-    conciseness = max(0.0, 1.0 - (length/600.0))
-    planning = 1.0 if re.search(r"\b(1\.|-|\*)", text) or ("\n" in text and len(text.splitlines())>=3) else 0.0
-    skepticism = min(1.0, len(re.findall(r"\b(might|may|could|uncertain|not sure)\b", text.lower()))/3.0)
-    return {"creativity": novelty, "conciseness": conciseness, "planning_focus": planning, "skepticism": skepticism}
-
-def _score_with_policy(text: str, memory: List[Dict[str,Any]], vec: Dict[str,float]) -> Tuple[float,Dict[str,float]]:
-    mem_text = " ".join([m["value"] for m in memory])
-    subs = _subscores(text, mem_text)
-    score = sum((1.0 + float(vec.get(k,0.0))) * v for k,v in subs.items())
-    return round(score,3), subs
-
-def _policy_nudge(vec: Dict[str,float], subs: Dict[str,float], direction: float = 0.06) -> Dict[str,float]:
-    new_vec = dict(vec)
-    history = db.get_policy_history(5)
-    for k,v in subs.items():
-        delta = (v - 0.5) * direction
-        if abs(delta) < 0.02:
-            delta = 0.0
-        new_val = new_vec.get(k,0.0) + delta
-        if history and len(history) >= 3:
-            recent = [h.get(k,0.0) for h in history[-3:] if isinstance(h,dict)]
-            new_val = 0.7 * new_val + 0.3 * (sum(recent)/max(1,len(recent)))
-        new_vec[k] = max(-1.0, min(1.0, new_val))
-    return new_vec
-
 def _policy_variances(window: int = 10) -> Dict[str, float]:
     hist = db.get_policy_history(window)
     variances: Dict[str, float] = {}
@@ -276,7 +219,7 @@ def prune_memory(max_items: int = 1000):
             db.upsert_fact(it["key"], it["value"], 0.01)
 
 # -----------------------------------------------------
-#  Memory command helpers (NEW)
+#  Memory command helpers (used by endpoints below)
 # -----------------------------------------------------
 def _memory_status() -> Dict[str, Any]:
     facts = db.all_facts()
@@ -399,424 +342,7 @@ def illusion_sleep_dream_recall():
         _history_append({"kind": "illusion", "dream": dream, "recall": recall, "birth": births})
 
 # -----------------------------------------------------
-#  Perspectives
-# -----------------------------------------------------
-def perturb_policy(vec: Dict[str, float], profile: str) -> Dict[str, float]:
-    p = dict(vec)
-    if profile == "explorer":
-        p["creativity"] = min(1.0, p.get("creativity",0)+0.3)
-        p["skepticism"] = max(-1.0, p.get("skepticism",0)-0.2)
-    elif profile == "skeptic":
-        p["skepticism"] = min(1.0, p.get("skepticism",0)+0.3)
-        p["creativity"] = max(-1.0, p.get("creativity",0)-0.2)
-    elif profile == "planner":
-        p["planning_focus"] = min(1.0, p.get("planning_focus",0)+0.3)
-        p["conciseness"] = min(1.0, p.get("conciseness",0)+0.2)
-    return p
-
-# -----------------------------------------------------
-#  DDG HTML fallback (lightweight parser)
-# -----------------------------------------------------
-def _ddg_html_results(query: str, limit: int = 5) -> List[Dict[str, str]]:
-    try:
-        q = urllib.parse.quote(query)
-        url = f"https://duckduckgo.com/html/?q={q}"
-        html = _http_get(url, timeout=12).decode("utf-8", errors="ignore")
-        items: List[Dict[str, str]] = []
-        for m in re.finditer(r'<a[^>]+class="[^"]*result__a[^"]*"[^>]*href="([^"]+)"[^>]*>(.*?)</a>', html, flags=re.I | re.S):
-            href = m.group(1)
-            title_raw = m.group(2)
-            title = re.sub("<.*?>", "", title_raw)
-            title = urllib.parse.unquote(re.sub(r"\s+", " ", title)).strip()
-            block_start = m.start()
-            snippet_match = re.search(r'class="[^"]*result__snippet[^"]*"[^>]*>(.*?)</', html[block_start:block_start+1500], flags=re.I | re.S)
-            snippet = ""
-            if snippet_match:
-                snippet = re.sub("<.*?>", "", snippet_match.group(1))
-                snippet = re.sub(r"\s+", " ", snippet).strip()
-            items.append({"title": title[:200], "url": href, "snippet": snippet[:280]})
-            if len(items) >= limit:
-                break
-        return items
-    except Exception:
-        return []
-
-# -----------------------------------------------------
-#  Tool call detector
-# -----------------------------------------------------
-def _maybe_tool_call(text: str):
-    """Return (is_tool_call, obj) if text is like:
-       {"tool": "...", "tool_input": "..."}
-    """
-    try:
-        obj = json.loads(text)
-        if isinstance(obj, dict) and "tool" in obj and "tool_input" in obj:
-            return True, obj
-    except Exception:
-        pass
-    return False, {}
-
-def _run_tool(obj: Dict[str, Any]) -> str:
-    tool, arg = obj.get("tool"), str(obj.get("tool_input", "")).strip()
-
-    # -----------------------------
-    # Calculator
-    # -----------------------------
-    if tool == "calculator":
-        if re.search(r"[A-Za-z]", arg) or re.fullmatch(r"\s*\d{4}\s*-\s*\d{2}\s*-\s*\d{2}\s*\s*", arg) or (":" in arg and re.search(r"\d", arg)):
-            return "calc_error: natural language or date input ignored"
-        try:
-            if re.fullmatch(r"[0-9\s+\-*/().]+", arg):
-                return str(eval(arg, {"__builtins__": {}}))
-        except Exception as e:
-            return f"calc_error: {e}"
-        return "calc_error: invalid input"
-
-    # -----------------------------
-    # Memory search
-    # -----------------------------
-    if tool == "memory_search":
-        return json.dumps({"memory_hits": db.search_facts(arg, limit=5)})
-
-    # -----------------------------
-    # Web search (DDG + optional OpenAI rerank)
-    # -----------------------------
-    if tool == "web_search":
-        if DRY_RUN:
-            return "web_search disabled (DRY_RUN)"
-
-        try:
-            # Normalize phrasing like: "search the web for X"
-            query = arg.strip()
-            query = re.sub(r'^(?:the\s+web\s+for|the\s+internet\s+for|search\s+the\s+web\s+for)\s+', '', query, flags=re.I)
-            query = re.sub(r'\s+', ' ', query).strip()
-            if not query:
-                return "web_search_error: empty query"
-
-            # --- DuckDuckGo Instant Answer (no-auth) ---
-            q = urllib.parse.quote(query)
-            url = f"https://api.duckduckgo.com/?q={q}&format=json&no_html=1&skip_disambig=1"
-            try:
-                data = json.loads(_http_get(url, timeout=12).decode("utf-8", errors="ignore"))
-            except Exception:
-                data = {}
-
-            results: List[Dict[str, str]] = []
-
-            abstract = (data.get("AbstractText") or "").strip() if isinstance(data, dict) else ""
-            if abstract:
-                results.append({
-                    "title": (data.get("Heading") or "Summary") if isinstance(data, dict) else "Summary",
-                    "url": (data.get("AbstractURL") or "") if isinstance(data, dict) else "",
-                    "snippet": abstract
-                })
-
-            related = data.get("RelatedTopics") if isinstance(data, dict) else []
-            related = related or []
-            for item in related:
-                if isinstance(item, dict) and "Topics" in item and isinstance(item["Topics"], list):
-                    for t in item["Topics"]:
-                        if isinstance(t, dict) and ("FirstURL" in t or "Text" in t):
-                            results.append({
-                                "title": (t.get("Text") or "").split(" - ")[0][:120],
-                                "url": t.get("FirstURL") or "",
-                                "snippet": (t.get("Text") or "")[:280]
-                            })
-                elif isinstance(item, dict) and ("FirstURL" in item or "Text" in item):
-                    results.append({
-                        "title": (item.get("Text") or "").split(" - ")[0][:120],
-                        "url": item.get("FirstURL") or "",
-                        "snippet": (item.get("Text") or "")[:280]
-                    })
-
-            # ✅ Fallback to HTML scraping if IA yields nothing
-            if not results:
-                results = _ddg_html_results(query, limit=5)
-
-            if not results:
-                results = [{"title": "No results", "url": "", "snippet": ""}]
-
-            payload = {"results": results[:5]}
-            OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-
-            # Optional rerank/cleanup via OpenAI
-            if OPENAI_API_KEY and results:
-                try:
-                    from openai import OpenAI
-                    client = OpenAI(api_key=OPENAI_API_KEY)
-
-                    system_msg = (
-                        "You are a web result formatter. "
-                        "Return ONLY JSON: an array named 'results' of up to 5 objects "
-                        "with fields: title, url, snippet. No extra text."
-                    )
-                    user_msg = (
-                        f"Query: {query}\n\n"
-                        f"Here are raw results (may be noisy). Re-rank for relevance, dedupe, and compress snippets:\n"
-                        f"{json.dumps(results[:8])}"
-                    )
-
-                    resp = client.chat.completions.create(
-                        model="gpt-4o-mini",
-                        messages=[
-                            {"role": "system", "content": system_msg},
-                            {"role": "user", "content": user_msg},
-                        ],
-                        temperature=0.0
-                    )
-
-                    content = (resp.choices[0].message.content or "").strip()
-                    parsed = None
-                    try:
-                        parsed = json.loads(content)
-                    except Exception:
-                        parsed = None
-
-                    if isinstance(parsed, dict) and "results" in parsed and isinstance(parsed["results"], list):
-                        payload = {"results": parsed["results"][:5]}
-                    elif isinstance(parsed, list):
-                        payload = {"results": parsed[:5]}
-                    else:
-                        payload = {"results": results[:5], "note": "llm_format_error_fallback"}
-
-                except Exception as e:
-                    payload = {"results": results[:5], "note": f"openai_rerank_error: {e}"}
-
-            return json.dumps(payload)
-
-        except Exception as e:
-            return f"web_search_error: {e}"
-
-    # -----------------------------
-    # Unknown tool
-    # -----------------------------
-    return f"unknown_tool: {tool}"
-
-# -----------------------------------------------------
-#  Chat
-# -----------------------------------------------------
-class ChatPayload(BaseModel):
-    prompt: str
-    model: Optional[str] = None
-    use_perspectives: bool = False
-
-@app.post("/chat")
-def chat(p: ChatPayload):
-    try:
-        _maybe_rate_limit(max(50, len(p.prompt)//3))
-
-        # === JSON tool pass-through ===
-        try:
-            _as_json = json.loads(p.prompt)
-            if isinstance(_as_json, dict) and "tool" in _as_json and "tool_input" in _as_json:
-                tool_result = _run_tool(_as_json)
-                return {
-                    "reply": f"(Tool {_as_json['tool']} -> {tool_result})",
-                    "meta": {"handled": "direct_tool_call"}
-                }
-        except Exception:
-            pass
-        # === end pass-through ===
-
-        # ----- Command pre-handler (bypass model) -----
-        cmd = p.prompt.strip()
-
-        # "search ..." or "web ..." -> force web_search tool
-        m1 = re.match(r'^(?:search|web)\s+(.+)$', cmd, flags=re.I)
-        if m1:
-            q = m1.group(1).strip()
-            tool_result = _run_tool({"tool": "web_search", "tool_input": q})
-            return {
-                "reply": f"(Tool web_search -> {tool_result})",
-                "meta": {"handled": "command_web_search", "query": q}
-            }
-
-        # /memory status
-        if re.fullmatch(r"/memory\s+status", cmd, flags=re.I):
-            status = _memory_status()
-            return {"reply": json.dumps(status), "meta": {"handled": "memory_status"}}
-
-        # store fact: "..."  OR  write memory: "..."
-        m = re.match(r'^(store\s+fact|write\s+memory)\s*:\s*"?(.+?)"?\s*$', cmd, flags=re.I)
-        if m:
-            text = m.group(2)
-            result = _memory_write(text, confidence=0.95)
-            return {"reply": f"[memory_ok] key={result['key']}", "meta": {"handled": "memory_write", "value": text}}
-
-        # recall last N facts
-        m = re.match(r'^recall\s+last\s+(\d+)\s+facts$', cmd, flags=re.I)
-        if m:
-            n = max(1, min(100, int(m.group(1))))
-            facts = _memory_recent(n)
-            return {"reply": json.dumps({"recent": facts}), "meta": {"handled": "memory_recent", "n": n}}
-        # Ask-about-memory awareness (before normal model path)
-        if _is_memory_awareness_query(cmd):
-            st = mem_export()  # from memory.py
-            enabled = bool(st.get("enabled"))
-            turns = int((st.get("stats") or {}).get("turns", 0))
-            recent_n = int((st.get("recent") or {}).get("n", 0))
-            recent_items = (st.get("recent") or {}).get("items", [])[-3:]  # last 3, compact
-
-            lines = []
-            for it in recent_items:
-                p = str(it.get("prompt", "")).replace("\n", " ")[:70]
-                r = str(it.get("reply", "")).replace("\n", " ")[:80]
-                ts = it.get("ts", "")
-                lines.append(f"- {ts}  Q:{p} | A:{r}")
-
-            summary = "\n".join(lines) if lines else "(no recent snapshots yet)"
-            return {
-                "reply": (
-                    "Yes — I persist chat turns now.\n"
-                    f"Enabled: {enabled} | Stored turns: {turns} | Recent window: {recent_n}\n"
-                    f"Recent chat snapshots:\n{summary}"
-                ),
-                "meta": {"handled": "memory_awareness", "memory_enabled": enabled, "turns": turns, "recent_n": recent_n}
-            }
-
-        # ----- Normal model path -----
-        vec = db.get_policy_vector()
-        style = get_style_prompt(vec)
-        memory = db.top_facts(5)
-
-        # Goal-aware + Reality Bridge context
-        goal_text = _goal_text()
-        goal_prefix = f"Active goal: {goal_text}\n\n" if goal_text else ""
-        bridge = _bridge_context(k_goal=1, k_facts=7, k_emergent=2) if _should_bridge() else ""
-
-        # ✅ Persistent Continuity Bridge (recent chats + emergent)
-        continuity = mem_bridge(p.prompt)
-
-        # Final context (order matters)
-        context = goal_prefix + bridge + (continuity or "") + _context_from_memory(p.prompt, k=5)
-
-        outs = []
-        used_profiles = []
-        if p.use_perspectives:
-            for profile in ["base", "explorer", "skeptic", "planner"]:
-                p_vec = perturb_policy(vec, profile) if profile != "base" else vec
-                p_style = get_style_prompt(p_vec)
-                outs.extend(complete_many(context + p.prompt, n=1, model=p.model or "gpt-4o-mini", style_hint=p_style))
-                used_profiles.append(profile)
-        else:
-            outs = complete_many(context + p.prompt, n=N_SAMPLES, model=p.model or "gpt-4o-mini", style_hint=style)
-            used_profiles.append("base")
-
-        processed = []
-        for o in outs:
-            text = o.get("content", "")
-            is_tool, obj = _maybe_tool_call(text)
-            if is_tool:
-                text = f"(Tool {obj['tool']} -> {_run_tool(obj)})"
-            processed.append(text)
-
-        if not processed:
-            processed = ["[no_output]"]
-
-        scored = []
-        for t in processed:
-            s, subs = _score_with_policy(t, memory, vec)
-            scored.append((s, t, subs))
-        scored.sort(key=lambda x: x[0], reverse=True)
-
-        best_score, best_text, best_subs = scored[0]
-
-        # Policy nudge & persist
-        vec = _policy_nudge(vec, best_subs, 0.06)
-        db.set_policy_vector(vec)
-
-        # Metrics + surprise tracking
-        metrics = db.kv_get("metrics") or {}
-        prev_total = int(metrics.get("total_replies", 0))
-        new_total = prev_total + 1
-        prev_avg = float(metrics.get("avg_reply_score", 0.0))
-        metrics["total_replies"] = new_total
-        metrics["avg_reply_score"] = round((prev_avg * prev_total + best_score) / new_total, 3)
-        db.kv_upsert("metrics", metrics)
-
-        # Surprise proxy
-        surprise = float(best_subs.get("creativity", 0.0))
-        db.kv_upsert("last.surprise", {"value": surprise})
-
-        # History
-        _history_append({
-            "kind": "chat",
-            "prompt": p.prompt,
-            "active_goal": goal_text,
-            "used_perspectives": p.use_perspectives,
-            "profiles": used_profiles,
-            "candidates": [t for _, t, _ in scored],
-            "chosen": best_text,
-            "score": best_score,
-            "bridge_used": bool(bridge or continuity),
-            "surprise": surprise
-        })
-
-
-        # ✅ Persist this chat turn to memory
-        try:
-            mem_save(
-                p.prompt,
-                best_text,
-                meta={
-                    "policy": vec,
-                    "score": best_score,
-                    "surprise": surprise,
-                    "profiles": used_profiles
-                }
-            )
-        except Exception:
-            pass
-
-        return {
-            "reply": best_text,
-            "meta": {
-                "score": best_score,
-                "surprise": round(surprise, 3),
-                "candidates": len(scored),
-                "used_perspectives": bool(p.use_perspectives),
-                "profiles": used_profiles,
-                "policy": vec,
-                "bridge_used": bool(bridge or continuity),
-            }
-        }
-
-    except Exception as e:
-        return {"reply": f"[server_error] {type(e).__name__}: {e}", "meta": {"error": True}}
-# -----------------------------------------------------
-#  Memory awareness helper (fixed)
-# -----------------------------------------------------
-def _is_memory_awareness_query(text: str) -> bool:
-    """
-    Detect short, direct questions explicitly asking about Helix's memory state.
-    Avoid triggering on analytical or multi-part prompts that merely mention
-    'memory' or 'chat' in a broader context.
-    """
-    t = (text or "").lower().strip()
-    if not t:
-        return False
-
-    # Ignore long or complex prompts (more than ~10 words)
-    if len(t.split()) > 10:
-        return False
-
-    # Explicit short patterns only
-    patterns = [
-        r"^can\s+you\s+remember",
-        r"^do\s+you\s+remember",
-        r"^what('?s| is)\s+your\s+memory",
-        r"^tell\s+me\s+(your\s+)?memory\s+status",
-        r"^how\s+many\s+chats\s+do\s+you\s+remember",
-        r"^do\s+you\s+retain\s+memory",
-        r"^are\s+you\s+able\s+to\s+remember",
-    ]
-    for p in patterns:
-        if re.search(p, t):
-            return True
-    return False
-
-# -----------------------------------------------------
-#  Planner / Tick
+#  Tick / Planner
 # -----------------------------------------------------
 @app.post("/tick")
 def tick():
@@ -963,15 +489,6 @@ def api_memory_fact(p: MemoryIn):
 def api_memory_recent(limit: int = 5):
     return {"recent": _memory_recent(max(1, min(100, limit)))}
 
-# -----------------------------------------------------
-#  History endpoint
-# -----------------------------------------------------
-@app.get("/history")
-def api_history(limit: int = 50):
-    items = _history_get()
-    return {"history": items[-limit:] if limit and limit > 0 else items}
-
-
 # --- memory compact (safe) ---
 @app.post("/memory/compact")
 def api_memory_compact():
@@ -997,16 +514,12 @@ def api_memory_enable(flag: bool = Query(True, description="Enable or disable pe
     mem_set_enabled(flag)
     return {"ok": True, "enabled": flag}
 
-
+# -----------------------------------------------------
+#  Goals
+# -----------------------------------------------------
 @app.delete("/goals/{goal_id}")
 def api_goals_delete(goal_id: int):
-    """
-    Delete a goal by id. Frontend's 'Delete' button should call this.
-    """
-    # If your db has a dedicated delete helper, use it:
-    # db.goals_delete(goal_id)
-    # Otherwise, implement deletion in utils.db and call it here.
-    deleted = db.goals_delete(goal_id)  # expects True/False
+    deleted = db.goals_delete(goal_id)
     if not deleted:
         raise HTTPException(404, "Goal not found")
     _history_append({"kind": "goal_delete", "id": goal_id})
@@ -1014,14 +527,6 @@ def api_goals_delete(goal_id: int):
 
 @app.post("/goals/dedupe")
 def api_goals_dedupe():
-    """
-    Remove duplicate goals by text (case/space-normalized), keep the oldest.
-    Frontend's 'Dedupe' button should call this.
-    """
-    # Prefer a db helper if you have one:
-    # removed = db.goals_dedupe()
-
-    # Generic fallback dedupe by text:
     goals = db.goals_list()
     seen = set()
     to_delete = []
@@ -1031,18 +536,14 @@ def api_goals_dedupe():
             to_delete.append(int(g.get("id", g.get("gid", -1))))
         else:
             seen.add(key)
-
     removed = 0
     for gid in to_delete:
         if gid is not None and gid != -1:
             if db.goals_delete(gid):
                 removed += 1
-
     _history_append({"kind": "goals_dedupe", "removed": removed})
     return {"status": "ok", "removed": removed, "goals": db.goals_list()}
-# -----------------------------------------------------
-#  Goals (robust parsing)
-# -----------------------------------------------------
+
 class GoalIn(BaseModel):
     text: str
 
@@ -1058,11 +559,9 @@ async def api_goals_add(
 ):
     text: Optional[str] = None
 
-    # 1) JSON pydantic
     if payload and getattr(payload, "text", None):
         text = payload.text
 
-    # 1b) raw JSON (any common key)
     if not text:
         try:
             js = await request.json()
@@ -1074,11 +573,9 @@ async def api_goals_add(
         except Exception:
             pass
 
-    # 2) ?text=...
     if not text and text_qs:
         text = text_qs
 
-    # 3) raw body (text/plain)
     if not text:
         try:
             raw = await request.body()
@@ -1088,7 +585,6 @@ async def api_goals_add(
         except Exception:
             pass
 
-    # 4) form data fallbacks
     if not text:
         try:
             form = await request.form()
@@ -1155,3 +651,9 @@ def _test_internet():
         return {"ok": True, "len": len(data)}
     except Exception as e:
         return {"ok": False, "error": str(e)}
+
+# -----------------------------------------------------
+#  Mount chat router last (no circular imports)
+# -----------------------------------------------------
+from api import chat as chat_router
+app.include_router(chat_router.router)
