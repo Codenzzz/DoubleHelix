@@ -28,7 +28,8 @@ router = APIRouter(prefix="", tags=["chat"])  # we expose /chat at root
 # -----------------------------------------------------
 REQUESTS_PER_MIN = int(os.getenv("REQUESTS_PER_MIN", "20"))
 TOKENS_PER_MIN   = int(os.getenv("TOKENS_PER_MIN", "12000"))
-N_SAMPLES        = int(os.getenv("N_SAMPLES", "3"))
+# clamp N_SAMPLES to 1..6 (defense in depth)
+N_SAMPLES        = max(1, min(6, int(os.getenv("N_SAMPLES", "3"))))
 DRY_RUN          = os.getenv("DRY_RUN", "true").lower() == "true"
 
 _window_start = time.time()
@@ -271,11 +272,39 @@ def _run_tool(obj: Dict[str, Any]) -> str:
 #  Memory-awareness query detector (chat-scoped)
 # -----------------------------------------------------
 def _is_memory_awareness_query(text: str) -> bool:
+    """
+    Detect short, direct questions about Helix's memory capabilities/status.
+    Covers 'remember' as well as 'have persistent/long-term memory' (incl. common misspelling).
+    """
     t = (text or "").lower().strip()
     if not t:
         return False
-    if len(t.split()) > 10:
+
+    # keep it to short/direct questions so we don't hijack analytical prompts
+    if len(t.split()) > 16:
         return False
+
+    # normalize common misspelling
+    t = t.replace("persistant", "persistent")
+
+    # quick keyword combos that imply memory capability/status questions
+    if (
+        "persistent memory" in t
+        or "long term memory" in t
+        or "long-term memory" in t
+        or "memory status" in t
+        or "memory enabled" in t
+        or "memory on" in t
+        or "do you have memory" in t
+        or "do you have persistent" in t
+        or "retain memory" in t
+        or "save memory" in t
+        or "store memory" in t
+        or "chat memory" in t
+    ):
+        return True
+
+    # regex patterns for classic phrasing
     patterns = [
         r"^can\s+you\s+remember",
         r"^do\s+you\s+remember",
@@ -420,15 +449,20 @@ def chat(p: ChatPayload):
 
         outs = []
         used_profiles = []
-        if p.use_perspectives:
-            for profile in ["base", "explorer", "skeptic", "planner"]:
-                p_vec = perturb_policy(vec, profile) if profile != "base" else vec
-                p_style = get_style_prompt(p_vec)
-                outs.extend(complete_many(context + p.prompt, n=1, model=p.model or "gpt-4o-mini", style_hint=p_style))
-                used_profiles.append(profile)
-        else:
-            outs = complete_many(context + p.prompt, n=N_SAMPLES, model=p.model or "gpt-4o-mini", style_hint=style)
-            used_profiles.append("base")
+        try:
+            if p.use_perspectives:
+                for profile in ["base", "explorer", "skeptic", "planner"]:
+                    p_vec = perturb_policy(vec, profile) if profile != "base" else vec
+                    p_style = get_style_prompt(p_vec)
+                    outs.extend(complete_many(context + p.prompt, n=1, model=p.model or "gpt-4o-mini", style_hint=p_style))
+                    used_profiles.append(profile)
+            else:
+                outs = complete_many(context + p.prompt, n=N_SAMPLES, model=p.model or "gpt-4o-mini", style_hint=style)
+                used_profiles.append("base")
+        except Exception as e:
+            # if the provider explodes, fail gracefully with a single candidate
+            outs = [{"content": f"[model_error] {type(e).__name__}: {e}"}]
+            used_profiles = ["base"]
 
         processed = []
         for o in outs:
