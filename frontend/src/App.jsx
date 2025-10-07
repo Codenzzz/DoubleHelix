@@ -20,7 +20,10 @@ async function getJSON(path, opts) {
   const res = await fetch(apiURL(path), opts);
   if (!res.ok) {
     const txt = await res.text().catch(() => "");
-    throw new Error(`GET ${path} → ${res.status} ${res.statusText} ${txt}`);
+    // Surface status code to allow fallbacks where needed
+    const err = new Error(`GET ${path} → ${res.status} ${res.statusText} ${txt}`);
+    err.status = res.status;
+    throw err;
   }
   return res.json();
 }
@@ -82,6 +85,49 @@ export default function App() {
   const [usePerspectives, setUsePerspectives] = useState(false);
   const [model, setModel] = useState(null); // keep null to use backend default
 
+  /** -------- history fetch with graceful fallbacks --------
+   * 1) Try /history?limit=80  (preferred; returns {history:[...]})
+   * 2) If 404 or shape mismatch, try /history           (may return {history:[...]})
+   * 3) If still unhappy, try /memory/status and synthesize a compact array
+   */
+  async function fetchHistory() {
+    // try /history?limit=80
+    try {
+      const h = await getJSON("/history?limit=80");
+      if (Array.isArray(h?.history)) return h.history;
+      if (Array.isArray(h?.items)) return h.items; // tolerate {items: [...]}
+    } catch (e) {
+      // if it's not 404, rethrow so we see real server errors
+      if (e?.status && e.status !== 404) throw e;
+    }
+
+    // try /history (no query)
+    try {
+      const h = await getJSON("/history");
+      if (Array.isArray(h?.history)) return h.history;
+      if (Array.isArray(h?.items)) return h.items;
+    } catch (e) {
+      if (e?.status && e.status !== 404) throw e;
+    }
+
+    // fallback to /memory/status (build a pseudo-history from recent items)
+    try {
+      const ms = await getJSON("/memory/status");
+      const latest = Array.isArray(ms?.latest) ? ms.latest : [];
+      // shape to look somewhat like history buffer entries
+      return latest.map((f) => ({
+        ts: "", // unknown
+        kind: "memory_latest",
+        key: f.key,
+        value: f.value,
+        confidence: f.confidence,
+      }));
+    } catch {
+      // final fallback -> empty array
+      return [];
+    }
+  }
+
   async function refresh() {
     setError(null);
 
@@ -130,12 +176,14 @@ export default function App() {
       setError((prev) => prev || String(e));
     }
 
-    // History buffer
+    // History buffer (with fallbacks)
     try {
-      const h = await getJSON("/history?limit=80");
-      setHistory(h?.history || []);
+      const items = await fetchHistory();
+      setHistory(items || []);
     } catch (e) {
-      setError((prev) => prev || String(e));
+      // Don’t hard-fail the page if history struggles
+      setHistory([]);
+      setError((prev) => prev || `history: ${String(e)}`);
     }
 
     // Clean Eyes preview (optional)
@@ -273,8 +321,7 @@ export default function App() {
   }
 
   // Helpers
-  const activeGoalObj =
-    goals.find((g) => g.active) || null;
+  const activeGoalObj = goals.find((g) => g.active) || null;
 
   return (
     <div className="container">
@@ -421,7 +468,7 @@ export default function App() {
             {history?.slice().reverse().map((h, i) => (
               <details key={i} style={{ marginBottom: 8 }}>
                 <summary style={{ cursor: "pointer" }}>
-                  <code>{h.ts}</code> — <em>{h.kind}</em>
+                  <code>{h.ts || "—"}</code> — <em>{h.kind || "entry"}</em>
                 </summary>
                 <pre style={{ margin: 0 }}>{JSON.stringify(h, null, 2)}</pre>
               </details>
