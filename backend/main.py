@@ -1,4 +1,4 @@
-import os, time, json, re, threading
+﻿import os, time, json, re, threading
 import urllib.parse
 import urllib.request
 from typing import List, Dict, Any, Optional, Tuple
@@ -12,7 +12,7 @@ from dotenv import load_dotenv
 from providers import complete_many, reflect_json
 from utils import db
 
-# ✅ Persistent chat memory bridge + saver (admin/export used here)
+# âœ… Persistent chat memory bridge + saver (admin/export used here)
 from memory import (
     bridge_context as mem_bridge,
     save_chat_turn as mem_save,
@@ -21,7 +21,7 @@ from memory import (
 )
 
 # =====================================================
-#  DoubleHelix API — Emergent Reflection Engine (v0.9.1)
+#  DoubleHelix API â€” Emergent Reflection Engine (v0.9.1)
 # =====================================================
 
 load_dotenv()
@@ -314,7 +314,7 @@ def _should_bridge() -> bool:
     return last_surprise >= bridge_s or max_var >= bridge_v
 
 # -----------------------------------------------------
-#  Illusion Loop (sleep → dream → recall)
+#  Illusion Loop (sleep â†’ dream â†’ recall)
 # -----------------------------------------------------
 def illusion_sleep_dream_recall():
     anchors = _bridge_context(k_goal=1, k_facts=7, k_emergent=2)
@@ -657,3 +657,7 @@ def _test_internet():
 # -----------------------------------------------------
 from api import chat as chat_router
 app.include_router(chat_router.router)
+
+from api.tot import router as tot_router
+app.include_router(tot_router)
+
