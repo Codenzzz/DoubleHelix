@@ -15,3 +15,4 @@ def self_update(
     req = EditReq(path=path, content=content, message=message)
     # Reuse the existing bridge logic (writes locally + pushes to Git if env is set)
     return edit_file(req)
+

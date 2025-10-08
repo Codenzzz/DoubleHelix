@@ -658,8 +658,8 @@ def _test_internet():
 # -----------------------------------------------------
 #  Mount chat router last (no circular imports)
 # -----------------------------------------------------
-from backend.api import chat as chat_router
-app.include_router(chat_router.router)
+from backend.api.chat import router as chat_router
+app.include_router(chat_router)
 
 
 # -----------------------------------------------------
