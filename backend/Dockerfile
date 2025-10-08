@@ -15,3 +15,4 @@ EXPOSE 8000
 # ✅ Key fix — explicitly point to /app/main.py (not relative)
 WORKDIR /app
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+
