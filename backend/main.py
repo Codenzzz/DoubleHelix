@@ -1,4 +1,7 @@
 ﻿import os, time, json, re, threading
+import os
+print(">>> DEBUG: Current working directory:", os.getcwd())
+print(">>> DEBUG: Files in current directory:", os.listdir("."))
 import urllib.parse
 import urllib.request
 from typing import List, Dict, Any, Optional, Tuple
@@ -16,7 +19,7 @@ load_dotenv(dotenv_path=Path(__file__).resolve().parent / ".env", override=True)
 from backend.providers import complete_many, reflect_json
 from backend.utils import db
 
-# âœ… Persistent chat memory bridge + saver (admin/export used here)
+# ✅ Persistent chat memory bridge + saver (admin/export used here)
 from backend.memory import (
     bridge_context as mem_bridge,
     save_chat_turn as mem_save,
@@ -492,7 +495,6 @@ def api_memory_fact(p: MemoryIn):
 def api_memory_recent(limit: int = 5):
     return {"recent": _memory_recent(max(1, min(100, limit)))}
 
-# --- memory compact (safe) ---
 @app.post("/memory/compact")
 def api_memory_compact():
     """
@@ -504,6 +506,7 @@ def api_memory_compact():
         return {"ok": True, "msg": "memory compacted"}
     except Exception as e:
         return {"ok": False, "error": str(e)}
+
 
 # -----------------------------------------------------
 #  Memory admin endpoints (optional)
@@ -658,21 +661,18 @@ def _test_internet():
 # -----------------------------------------------------
 #  Mount chat router last (no circular imports)
 # -----------------------------------------------------
-from backend.api.chat import router as chat_router
-app.include_router(chat_router)
-
+from backend.api import chat as chat_router
+app.include_router(chat_router.router)
 
 # -----------------------------------------------------
 #  HelixBridge (file edit / commit)
 # -----------------------------------------------------
-# GitHub bridge (has its own prefix, e.g. "/admin/github")
 from backend.api.github_bridge import router as github_router
 app.include_router(github_router)
 
 # Self-update (prefix="/admin/self")
 from backend.api.self_update import router as self_router
 app.include_router(self_router)
-from api.admin_tools import router as admin_router
+
+from backend.api.admin_tools import router as admin_router
 app.include_router(admin_router, prefix="/admin", tags=["admin"])
-
-
