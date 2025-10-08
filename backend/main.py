@@ -661,8 +661,6 @@ def _test_internet():
 from api import chat as chat_router
 app.include_router(chat_router.router)
 
-from api.tot import router as tot_router
-app.include_router(tot_router)
 
 # -----------------------------------------------------
 #  HelixBridge (file edit / commit)
