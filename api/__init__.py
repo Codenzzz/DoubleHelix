@@ -1,2 +1,2 @@
 ﻿# DoubleHelix api package
-# expose nothing by default; submodules import explicitly
+# Submodules are imported explicitly (e.g., from api.admin_tools import router as admin_router)
