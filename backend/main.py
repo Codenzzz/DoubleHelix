@@ -13,11 +13,11 @@ from dotenv import load_dotenv
 # Force-load .env from the backend directory, even if run from elsewhere
 load_dotenv(dotenv_path=Path(__file__).resolve().parent / ".env", override=True)
 
-from providers import complete_many, reflect_json
-from utils import db
+from backend.providers import complete_many, reflect_json
+from backend.utils import db
 
 # âœ… Persistent chat memory bridge + saver (admin/export used here)
-from memory import (
+from backend.memory import (
     bridge_context as mem_bridge,
     save_chat_turn as mem_save,
     export_state as mem_export,
@@ -499,7 +499,7 @@ def api_memory_compact():
     Soft-prune old chat records by lowering confidence on the oldest entries.
     """
     try:
-        from memory import _maybe_prune
+        from backend.memory import _maybe_prune
         _maybe_prune()
         return {"ok": True, "msg": "memory compacted"}
     except Exception as e:
@@ -658,7 +658,7 @@ def _test_internet():
 # -----------------------------------------------------
 #  Mount chat router last (no circular imports)
 # -----------------------------------------------------
-from api import chat as chat_router
+from backend.api import chat as chat_router
 app.include_router(chat_router.router)
 
 
@@ -666,12 +666,13 @@ app.include_router(chat_router.router)
 #  HelixBridge (file edit / commit)
 # -----------------------------------------------------
 # GitHub bridge (has its own prefix, e.g. "/admin/github")
-from api.github_bridge import router as github_router
+from backend.api.github_bridge import router as github_router
 app.include_router(github_router)
 
 # Self-update (prefix="/admin/self")
-from api.self_update import router as self_router
+from backend.api.self_update import router as self_router
 app.include_router(self_router)
 from api.admin_tools import router as admin_router
 app.include_router(admin_router, prefix="/admin", tags=["admin"])
+
 

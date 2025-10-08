@@ -1,4 +1,4 @@
-# backend/api/github_bridge.py
+﻿# backend/api/github_bridge.py
 from fastapi import APIRouter, Body, Depends, HTTPException
 from pydantic import BaseModel
 from pathlib import Path
@@ -6,7 +6,7 @@ import os, time, hashlib, base64, requests
 
 # Auth (currently permissive; tighten later)
 try:
-    from api.helix_verify import require_scopes
+    from backend.api.helix_verify import require_scopes
 except Exception:
     def require_scopes(_):  # fallback permissive
         def _checker(): return True

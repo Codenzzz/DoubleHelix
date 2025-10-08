@@ -1,4 +1,4 @@
-# backend/memory.py
+﻿# backend/memory.py
 # Bounded continuity memory for DoubleHelix (ASCII-safe, restart-persistent)
 
 import os
@@ -8,7 +8,7 @@ import re
 import hashlib
 from typing import Dict, Any, List, Optional
 
-from utils import db
+from backend.utils import db
 
 # -----------------------------
 # Config / env
@@ -84,7 +84,7 @@ def _regex_any(patterns: List[str], text: str) -> List[str]:
 # Temporal awareness layer
 # -----------------------------
 def update_clock(event: str = "tick") -> Dict[str, Any]:
-    """Record a temporal 'heartbeat' and compute Δt since last one."""
+    """Record a temporal 'heartbeat' and compute Î”t since last one."""
     now_ts = _now_ts()
     clock = db.kv_get(KV_CLOCK) or {"history": []}
     hist = list(clock.get("history", []))
@@ -133,7 +133,7 @@ def export_state() -> Dict[str, Any]:
         "recent": db.kv_get(KV_RECENT) or {},
         "markers": db.kv_get(KV_MARKERS) or {},
         "topic": db.kv_get(KV_TOPIC) or {},
-        "clock": get_clock(),  # ← temporal data
+        "clock": get_clock(),  # â† temporal data
     }
 
 def set_enabled(flag: bool):

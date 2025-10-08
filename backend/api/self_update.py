@@ -1,6 +1,6 @@
-# backend/api/self_update.py
+﻿# backend/api/self_update.py
 from fastapi import APIRouter, Body, HTTPException
-from api.github_bridge import EditReq, edit_file
+from backend.api.github_bridge import EditReq, edit_file
 
 router = APIRouter(prefix="/admin/self", tags=["admin:self"])
 

@@ -1,21 +1,21 @@
-# api/chat.py
+﻿# api/chat.py
 import os, time, json, re, urllib.parse, urllib.request, asyncio
 from typing import List, Dict, Any, Optional, Tuple
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
-from providers import complete_many, reflect_json
+from backend.providers import complete_many, reflect_json
 try:
     # optional: some deployments don't export rerank
-    from providers import rerank  # type: ignore
+    from backend.providers import rerank  # type: ignore
 except Exception:  # pragma: no cover
     rerank = None  # fallback safely
 
-from utils import db
+from backend.utils import db
 
-# ✅ Persistent chat memory bridge + saver
-from memory import (
+# âœ… Persistent chat memory bridge + saver
+from backend.memory import (
     bridge_context as mem_bridge,
     save_chat_turn as mem_save,
     export_state as mem_export,
@@ -456,7 +456,7 @@ async def chat(p: ChatPayload):
 
             return {
                 "reply": (
-                    "✅ Memory diagnostic\n"
+                    "âœ… Memory diagnostic\n"
                     f"- Wrote: 'ping test memory'\n"
                     f"- Last 2 facts: {last_two}\n"
                     f"- Total facts: {total_facts}\n"
@@ -501,7 +501,7 @@ async def chat(p: ChatPayload):
             summary = "\n".join(lines) if lines else "(no recent snapshots yet)"
             return {
                 "reply": (
-                    "Yes — I persist chat turns now.\n"
+                    "Yes â€” I persist chat turns now.\n"
                     f"Enabled: {enabled} | Stored turns: {turns} | Recent window: {recent_n}\n"
                     f"Recent chat snapshots:\n{summary}"
                 ),
@@ -640,7 +640,7 @@ async def chat(p: ChatPayload):
             "surprise": surprise
         })
 
-        # ✅ Persist this chat turn to memory
+        # âœ… Persist this chat turn to memory
         try:
             mem_save(
                 p.prompt,            # store original prompt
