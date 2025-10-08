@@ -3,16 +3,13 @@ import urllib.parse
 import urllib.request
 from typing import List, Dict, Any, Optional, Tuple
 
-from fastapi import FastAPI, HTTPException, Body, Request, Query
+from fastapi import FastAPI, HTTPException, Body, Request, Query, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
-from pathlib import Path
 from dotenv import load_dotenv
 
-# Force-load .env from the backend directory, even if run from elsewhere
-load_dotenv(dotenv_path=Path(__file__).resolve().parent / ".env", override=True)
-
+from api.helix_verify import require_scopes
 from providers import complete_many, reflect_json
 from utils import db
 
@@ -28,8 +25,19 @@ from memory import (
 #  DoubleHelix API â€” Emergent Reflection Engine (v0.9.1)
 # =====================================================
 
+# Load env BEFORE importing routers that read env at import time
+load_dotenv()
+
 app = FastAPI(title="DoubleHelix API", version="0.9.1")
 db.init()
+
+# â¬‡ï¸ Routers
+from api.chat import router as chat_router
+from api.helix_auth import router as helix_auth_router
+
+# â¬‡ï¸ Register routers
+app.include_router(helix_auth_router)   # /v1/auth/*
+app.include_router(chat_router)         # existing chat endpoints
 
 # -----------------------------------------------------
 #  CORS (Env + Fallback)
@@ -76,10 +84,10 @@ def bootstrap_defaults():
             "memory_max": int(os.getenv("MEMORY_MAX", "1000")),
             "pattern_threshold": int(os.getenv("PATTERN_THRESHOLD", "3")),
             # New knobs:
-            "clean_eyes_alpha": float(os.getenv("CLEAN_EYES_ALPHA", "0.5")),  # blend strength
-            "clean_eyes_var": float(os.getenv("CLEAN_EYES_VAR", "0.02")),     # variance trigger
-            "bridge_surprise": float(os.getenv("BRIDGE_SURPRISE", "0.65")),   # surprise trigger
-            "bridge_var": float(os.getenv("BRIDGE_VAR", "0.03")),             # variance trigger
+            "clean_eyes_alpha": float(os.getenv("CLEAN_EYES_ALPHA", "0.5")),
+            "clean_eyes_var": float(os.getenv("CLEAN_EYES_VAR", "0.02")),
+            "bridge_surprise": float(os.getenv("BRIDGE_SURPRISE", "0.65")),
+            "bridge_var": float(os.getenv("BRIDGE_VAR", "0.03")),
         })
 
     if not db.kv_get("metrics"):
@@ -130,7 +138,7 @@ def _history_append(event: Dict[str, Any]):
     db.kv_upsert(HIST_KEY, {"items": items})
 
 # -----------------------------------------------------
-#  Context + Style (kept for non-chat features that may reuse later)
+#  Context + Style
 # -----------------------------------------------------
 def get_style_prompt(vec: Dict[str, float]) -> str:
     evolved = db.kv_get("prompts.style_hint")
@@ -159,6 +167,11 @@ def _style_hint(vec: Dict[str, float]) -> str:
 @app.get("/healthz")
 def health():
     return {"status": "ok"}
+
+@app.get("/v1/ping/secure", tags=["power"])
+def ping_secure(user = Depends(require_scopes(["helix.read"]))):
+    # user is the decoded JWT payload returned by verify_helix_token
+    return {"ok": True, "who": user.get("sub"), "scopes": user.get("scopes", [])}
 
 # -----------------------------------------------------
 #  Policy variance helpers (used by tick/bridge/clean eyes)
@@ -484,11 +497,12 @@ class MemoryIn(BaseModel):
     confidence: Optional[float] = 0.95
     key: Optional[str] = None
 
-@app.post("/memory/fact")
+@app.post("/memory/fact", dependencies=[Depends(require_scopes(["memory.write"]))])
 def api_memory_fact(p: MemoryIn):
+    """Secure endpoint: requires scope 'memory.write'."""
     return _memory_write(p.text, confidence=float(p.confidence or 0.95), key=p.key)
 
-@app.get("/memory/recent")
+@app.get("/memory/recent", dependencies=[Depends(require_scopes(["memory.read"]))])
 def api_memory_recent(limit: int = 5):
     return {"recent": _memory_recent(max(1, min(100, limit)))}
 
@@ -516,6 +530,101 @@ def api_memory_export():
 def api_memory_enable(flag: bool = Query(True, description="Enable or disable persistent chat memory")):
     mem_set_enabled(flag)
     return {"ok": True, "enabled": flag}
+
+
+# -----------------------------------------------------
+#  Admin: Minimal GitHub commit bridge (requires admin.edit or full-access)
+# -----------------------------------------------------
+import base64 as _b64
+import urllib.request as _u
+import urllib.error as _ue
+from pydantic import Field
+
+class GHEditReq(BaseModel):
+    path: str = Field(..., description="Repo path like 'api/tot.py' (no leading slash)")
+    content: str = Field(..., description="Full file contents (UTF-8)")
+    message: Optional[str] = Field(None, description="Commit message")
+    branch: Optional[str] = Field(None, description="Target branch (default GITHUB_BRANCH)")
+
+def _gh_env():
+    repo  = os.getenv("GITHUB_REPO")
+    token = os.getenv("GITHUB_TOKEN")
+    default_branch = os.getenv("GITHUB_BRANCH", "main")
+    if not repo or not token:
+        raise HTTPException(500, "GITHUB_REPO and GITHUB_TOKEN must be set in env")
+    return repo, token, default_branch
+
+def _gh_headers(token: str) -> dict:
+    return {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+        "User-Agent": "helix-github-bridge"
+    }
+
+def _gh_api(method: str, url: str, token: str, data: Optional[dict] = None) -> dict:
+    body = None
+    if data is not None:
+        body = json.dumps(data).encode("utf-8")
+    req = _u.Request(url, data=body, method=method, headers=_gh_headers(token))
+    try:
+        with _u.urlopen(req, timeout=20) as r:
+            raw = r.read()
+            return json.loads(raw.decode("utf-8")) if raw else {}
+    except _ue.HTTPError as e:
+        try:
+            err_body = e.read().decode("utf-8")
+        except Exception:
+            err_body = str(e)
+        raise HTTPException(e.code, f"GitHub API error: {err_body}")
+    except Exception as e:
+        raise HTTPException(500, f"GitHub API call failed: {e}")
+
+def _gh_get_file_sha(repo: str, token: str, path: str, branch: str) -> Optional[str]:
+    # Returns file SHA if it exists on branch; None if not found
+    url = f"https://api.github.com/repos/{repo}/contents/{path}?ref={branch}"
+    try:
+        res = _gh_api("GET", url, token)
+        return res.get("sha")
+    except HTTPException as e:
+        if e.status_code == 404:
+            return None
+        raise
+
+def _gh_put_contents(repo: str, token: str, path: str, branch: str, content: str, message: str, sha: Optional[str]):
+    url = f"https://api.github.com/repos/{repo}/contents/{path}"
+    data = {
+        "message": message,
+        "content": _b64.b64encode(content.encode("utf-8")).decode("ascii"),
+        "branch": branch,
+    }
+    if sha:
+        data["sha"] = sha
+    return _gh_api("PUT", url, token, data)
+
+@app.post("/admin/github/edit", dependencies=[Depends(require_scopes(["admin.edit"]))], tags=["admin"])
+def admin_github_edit(req: GHEditReq):
+    """
+    Create/update a file on GitHub default branch (or req.branch if provided).
+    """
+    repo, token, default_branch = _gh_env()
+    branch = req.branch or default_branch
+    path = req.path.lstrip("/")
+    message = req.message or f"helix(github): {'update' if _gh_get_file_sha(repo, token, path, branch) else 'create'} {path}"
+
+    sha = _gh_get_file_sha(repo, token, path, branch)
+    put_res = _gh_put_contents(repo, token, path, branch, req.content, message, sha)
+
+    return {
+        "ok": True,
+        "repo": repo,
+        "path": path,
+        "branch": branch,
+        "committed": {
+            "path": (put_res.get('content') or {}).get('path'),
+            "commit_sha": (put_res.get('commit') or {}).get('sha'),
+            "html_url": (put_res.get('content') or {}).get('html_url'),
+        }
+    }
 
 # -----------------------------------------------------
 #  Goals
@@ -655,18 +764,6 @@ def _test_internet():
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
-# -----------------------------------------------------
-#  Mount chat router last (no circular imports)
-# -----------------------------------------------------
-from api import chat as chat_router
-app.include_router(chat_router.router)
-
 from api.tot import router as tot_router
 app.include_router(tot_router)
-
-# -----------------------------------------------------
-#  HelixBridge (file edit / commit)
-# -----------------------------------------------------
-from api.github_bridge import router as github_router
-app.include_router(github_router)
 
