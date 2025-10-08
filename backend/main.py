@@ -672,3 +672,6 @@ app.include_router(github_router)
 # Self-update (prefix="/admin/self")
 from api.self_update import router as self_router
 app.include_router(self_router)
+
+from api import admin_tools
+app.include_router(admin_tools.router, prefix="/admin", tags=["admin"])
