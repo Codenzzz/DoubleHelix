@@ -2,11 +2,13 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# Copy only backend dependencies first for efficient caching
+# Copy reqs and force a fresh install via cache-bust
 COPY requirements.txt ./
-RUN pip install --no-cache-dir -r requirements.txt
+ARG CACHEBUST=20251008-2
+RUN python -m pip install --upgrade pip \
+ && pip install --no-cache-dir -r requirements.txt
 
-# Copy the rest of the backend code
+# Copy the rest of the code
 COPY . .
 
 EXPOSE 8000
