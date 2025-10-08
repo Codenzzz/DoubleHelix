@@ -672,3 +672,6 @@ app.include_router(github_router)
 
 from api.self_update import router as self_router
 app.include_router(self_router)
+# ✅ GitHub + Admin bridge
+from api.github_bridge import router as github_router
+app.include_router(github_router, prefix="/admin/self", tags=["admin"])
