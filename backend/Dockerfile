@@ -2,23 +2,23 @@
 
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
-
-# Work from /app
 WORKDIR /app
 
-# Install dependencies first (layer cache)
 COPY backend/requirements.txt ./requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy the entire repo into the image
+# Copy repo
 COPY . .
 
-# Make sure Python can import from /app
 ENV PYTHONPATH=/app
 
-# (optional) sanity check during build — fails early if imports break
+# Early check at build time (still useful)
 RUN python -c "import importlib; importlib.import_module('backend.main'); print('import ok')"
 
-EXPOSE 8000
-CMD ["sh","-lc","python backend/bootcheck.py && python -m uvicorn backend.main:app --host 0.0.0.0 --port 8000 --log-level debug --app-dir /app"]
+# NEW: entrypoint that always runs bootcheck, then execs CMD or override
+COPY backend/start.sh /start.sh
+RUN chmod +x /start.sh
+ENTRYPOINT ["/start.sh"]
 
+# Default command if Render doesn't override
+CMD ["python","-m","uvicorn","backend.main:app","--host","0.0.0.0","--port","8000","--log-level","debug","--app-dir","/app"]
