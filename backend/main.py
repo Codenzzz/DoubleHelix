@@ -662,6 +662,9 @@ app.include_router(self_router)
 from backend.api.admin_tools import router as admin_router  # noqa: E402
 app.include_router(admin_router, prefix="/admin", tags=["admin"])
 
+from backend.api.helix_auth import router as auth_router
+app.include_router(auth_router)
+
 # -----------------------------------------------------
 #  Background: AutoTick (STARTED ON STARTUP, not at import)
 # -----------------------------------------------------
