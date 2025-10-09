@@ -20,4 +20,5 @@ ENV PYTHONPATH=/app
 RUN python -c "import importlib; importlib.import_module('backend.main'); print('import ok')"
 
 EXPOSE 8000
-CMD ["uvicorn", "backend.main:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["sh","-lc","python backend/bootcheck.py && python -m uvicorn backend.main:app --host 0.0.0.0 --port 8000 --log-level debug --app-dir /app"]
+
