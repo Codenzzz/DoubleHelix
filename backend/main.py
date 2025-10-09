@@ -1,38 +1,43 @@
-﻿import os, time, json, re, threading
+﻿# backend/main.py
+# Import-safe FastAPI app for Render (no side-effects at import time)
+
+from __future__ import annotations
+
 import os
-print(">>> DEBUG: Current working directory:", os.getcwd())
-print(">>> DEBUG: Files in current directory:", os.listdir("."))
-import urllib.parse
+import time
+import json
+import threading
+import logging
+from typing import List, Dict, Any, Optional
+
 import urllib.request
-from typing import List, Dict, Any, Optional, Tuple
+from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Body, Request, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
-from pathlib import Path
-from dotenv import load_dotenv
 
-# Force-load .env from the backend directory, even if run from elsewhere
-load_dotenv(dotenv_path=Path(__file__).resolve().parent / ".env", override=True)
-
-from backend.providers import complete_many, reflect_json
+# ---- Local modules (imports only; no execution here)
+from backend.providers import complete_many, reflect_json  # noqa: F401  (kept for future use)
 from backend.utils import db
-
-# ✅ Persistent chat memory bridge + saver (admin/export used here)
 from backend.memory import (
-    bridge_context as mem_bridge,
-    save_chat_turn as mem_save,
+    bridge_context as mem_bridge,   # noqa: F401 (kept for future use)
+    save_chat_turn as mem_save,     # noqa: F401
     export_state as mem_export,
     set_enabled as mem_set_enabled,
 )
 
-# =====================================================
-#  DoubleHelix API â€” Emergent Reflection Engine (v0.9.1)
-# =====================================================
+try:
+    from dotenv import load_dotenv
+except Exception:  # dotenv optional at runtime
+    def load_dotenv(*args, **kwargs):  # type: ignore
+        return False
 
+# =====================================================
+#  DoubleHelix API — Emergent Reflection Engine (v0.9.1)
+# =====================================================
 app = FastAPI(title="DoubleHelix API", version="0.9.1")
-db.init()
 
 # -----------------------------------------------------
 #  CORS (Env + Fallback)
@@ -55,7 +60,7 @@ app.add_middleware(
 )
 
 # -----------------------------------------------------
-#  Bootstrap Defaults
+#  Bootstrap Defaults (definitions only; executed on startup)
 # -----------------------------------------------------
 def bootstrap_defaults():
     db.upsert_fact("system.name", "DoubleHelix", 0.95)
@@ -72,33 +77,37 @@ def bootstrap_defaults():
         db.goals_add("Summarize my current operational principles.")
 
     if not db.kv_get("thresholds"):
-        db.kv_upsert("thresholds", {
-            "surprise": float(os.getenv("SURPRISE_THRESHOLD", "0.6")),
-            "consolidation_interval": int(os.getenv("CONSOLIDATION_INTERVAL", "12")),
-            "meta_interval": int(os.getenv("META_INTERVAL", "48")),
-            "memory_max": int(os.getenv("MEMORY_MAX", "1000")),
-            "pattern_threshold": int(os.getenv("PATTERN_THRESHOLD", "3")),
-            # New knobs:
-            "clean_eyes_alpha": float(os.getenv("CLEAN_EYES_ALPHA", "0.5")),  # blend strength
-            "clean_eyes_var": float(os.getenv("CLEAN_EYES_VAR", "0.02")),     # variance trigger
-            "bridge_surprise": float(os.getenv("BRIDGE_SURPRISE", "0.65")),   # surprise trigger
-            "bridge_var": float(os.getenv("BRIDGE_VAR", "0.03")),             # variance trigger
-        })
+        db.kv_upsert(
+            "thresholds",
+            {
+                "surprise": float(os.getenv("SURPRISE_THRESHOLD", "0.6")),
+                "consolidation_interval": int(os.getenv("CONSOLIDATION_INTERVAL", "12")),
+                "meta_interval": int(os.getenv("META_INTERVAL", "48")),
+                "memory_max": int(os.getenv("MEMORY_MAX", "1000")),
+                "pattern_threshold": int(os.getenv("PATTERN_THRESHOLD", "3")),
+                # New knobs:
+                "clean_eyes_alpha": float(os.getenv("CLEAN_EYES_ALPHA", "0.5")),  # blend strength
+                "clean_eyes_var": float(os.getenv("CLEAN_EYES_VAR", "0.02")),     # variance trigger
+                "bridge_surprise": float(os.getenv("BRIDGE_SURPRISE", "0.65")),   # surprise trigger
+                "bridge_var": float(os.getenv("BRIDGE_VAR", "0.03")),             # variance trigger
+            },
+        )
 
     if not db.kv_get("metrics"):
-        db.kv_upsert("metrics", {
-            "goals_completed": 0,
-            "drafts_per_day": 0,
-            "avg_reply_score": 0.0,
-            "total_replies": 0
-        })
-
-bootstrap_defaults()
+        db.kv_upsert(
+            "metrics",
+            {
+                "goals_completed": 0,
+                "drafts_per_day": 0,
+                "avg_reply_score": 0.0,
+                "total_replies": 0,
+            },
+        )
 
 REQUESTS_PER_MIN = int(os.getenv("REQUESTS_PER_MIN", "20"))
-TOKENS_PER_MIN   = int(os.getenv("TOKENS_PER_MIN", "12000"))
-N_SAMPLES        = int(os.getenv("N_SAMPLES", "3"))
-DRY_RUN          = os.getenv("DRY_RUN", "true").lower() == "true"
+TOKENS_PER_MIN = int(os.getenv("TOKENS_PER_MIN", "12000"))
+N_SAMPLES = int(os.getenv("N_SAMPLES", "3"))
+DRY_RUN = os.getenv("DRY_RUN", "true").lower() == "true"
 
 # -----------------------------------------------------
 #  Simple HTTP helper with headers (used by /debug/env)
@@ -142,13 +151,18 @@ def get_style_prompt(vec: Dict[str, float]) -> str:
     return _style_hint(vec)
 
 def _style_hint(vec: Dict[str, float]) -> str:
-    c, con, plan, sk = [vec.get(k,0.0) for k in ("creativity","conciseness","planning_focus","skepticism")]
+    c, con, plan, sk = [vec.get(k, 0.0) for k in ("creativity", "conciseness", "planning_focus", "skepticism")]
     prefs = []
-    if c > 0.1:  prefs.append("emphasize novelty and examples")
-    if con > 0.1: prefs.append("be concise and avoid fluff")
-    if plan > 0.1:prefs.append("use step-by-step plans where helpful")
-    if sk > 0.1:  prefs.append("add caveats when uncertain")
-    if not prefs: prefs.append("balanced, helpful responses")
+    if c > 0.1:
+        prefs.append("emphasize novelty and examples")
+    if con > 0.1:
+        prefs.append("be concise and avoid fluff")
+    if plan > 0.1:
+        prefs.append("use step-by-step plans where helpful")
+    if sk > 0.1:
+        prefs.append("add caveats when uncertain")
+    if not prefs:
+        prefs.append("balanced, helpful responses")
     prefs.append('If calculation is required, respond with JSON tool call {"tool":"calculator","tool_input":"EXPR"}.')
     prefs.append('If memory helps, respond with {"tool":"memory_search","tool_input":"query"}.')
     prefs.append('If web info helps, respond with {"tool":"web_search","tool_input":"QUERY"}.')
@@ -170,12 +184,12 @@ def _policy_variances(window: int = 10) -> Dict[str, float]:
     hist = db.get_policy_history(window)
     variances: Dict[str, float] = {}
     if len(hist) >= 2:
-        for trait in ("creativity","conciseness","planning_focus","skepticism"):
-            vals = [float(h.get(trait,0.0)) for h in hist if isinstance(h,dict)]
+        for trait in ("creativity", "conciseness", "planning_focus", "skepticism"):
+            vals = [float(h.get(trait, 0.0)) for h in hist if isinstance(h, dict)]
             if len(vals) >= 2:
-                m = sum(vals)/len(vals)
-                variances[trait] = sum((v-m)**2 for v in vals)/len(vals)
-    return {k: round(v,4) for k,v in variances.items()}
+                m = sum(vals) / len(vals)
+                variances[trait] = sum((v - m) ** 2 for v in vals) / len(vals)
+    return {k: round(v, 4) for k, v in variances.items()}
 
 # -----------------------------------------------------
 #  Memory helpers
@@ -221,7 +235,7 @@ def prune_memory(max_items: int = 1000):
     items = db.all_facts()
     if len(items) > max_items:
         items.sort(key=lambda x: (x.get("confidence", 0.5), x.get("ts", "")))
-        for it in items[:len(items)-max_items]:
+        for it in items[: len(items) - max_items]:
             db.upsert_fact(it["key"], it["value"], 0.01)
 
 # -----------------------------------------------------
@@ -229,11 +243,11 @@ def prune_memory(max_items: int = 1000):
 # -----------------------------------------------------
 def _memory_status() -> Dict[str, Any]:
     facts = db.all_facts()
-    latest = sorted(facts, key=lambda x: x.get("ts",""))[-5:] if facts else []
+    latest = sorted(facts, key=lambda x: x.get("ts", ""))[-5:] if facts else []
     return {
         "enabled": True,
         "total_facts": len(facts),
-        "latest": [{"key": f["key"], "value": f["value"], "confidence": f.get("confidence", 0.0)} for f in latest]
+        "latest": [{"key": f["key"], "value": f["value"], "confidence": f.get("confidence", 0.0)} for f in latest],
     }
 
 def _memory_write(text: str, confidence: float = 0.95, key: Optional[str] = None) -> Dict[str, Any]:
@@ -244,7 +258,7 @@ def _memory_write(text: str, confidence: float = 0.95, key: Optional[str] = None
 
 def _memory_recent(limit: int = 5) -> List[Dict[str, Any]]:
     facts = db.all_facts()
-    facts = sorted(facts, key=lambda x: x.get("ts",""))[-limit:] if facts else []
+    facts = sorted(facts, key=lambda x: x.get("ts", ""))[-limit:] if facts else []
     return [{"key": f["key"], "value": f["value"], "confidence": f.get("confidence", 0.0)} for f in facts]
 
 # -----------------------------------------------------
@@ -256,12 +270,10 @@ def _snapshot_baseline_if_missing():
     if not db.kv_get(BASELINE_POLICY_KEY):
         db.kv_upsert(BASELINE_POLICY_KEY, db.get_policy_vector())
 
-_snapshot_baseline_if_missing()
-
-def _soft_blend(curr: Dict[str,float], base: Dict[str,float], alpha: float) -> Dict[str,float]:
+def _soft_blend(curr: Dict[str, float], base: Dict[str, float], alpha: float) -> Dict[str, float]:
     out = dict(curr)
-    for k in ("creativity","conciseness","planning_focus","skepticism"):
-        out[k] = float(alpha)*float(base.get(k,0.0)) + float(1.0-alpha)*float(curr.get(k,0.0))
+    for k in ("creativity", "conciseness", "planning_focus", "skepticism"):
+        out[k] = float(alpha) * float(base.get(k, 0.0)) + float(1.0 - alpha) * float(curr.get(k, 0.0))
         out[k] = max(-1.0, min(1.0, out[k]))
     return out
 
@@ -296,7 +308,7 @@ def _bridge_context(k_goal: int = 1, k_facts: int = 7, k_emergent: int = 2) -> s
     facts = db.top_facts(limit=20)
     facts_sorted = sorted(facts, key=lambda x: float(x.get("confidence", 0.5)), reverse=True)
     picked = facts_sorted[:k_facts]
-    emergent = [f for f in facts_sorted if str(f.get("key","")).startswith("emergent:")][:k_emergent]
+    emergent = [f for f in facts_sorted if str(f.get("key", "")).startswith("emergent:")][:k_emergent]
     lines = []
     if goal_text:
         lines.append(f"Active goal: {goal_text}")
@@ -320,14 +332,14 @@ def _should_bridge() -> bool:
     return last_surprise >= bridge_s or max_var >= bridge_v
 
 # -----------------------------------------------------
-#  Illusion Loop (sleep â†’ dream â†’ recall)
+#  Illusion Loop (sleep → dream → recall)
 # -----------------------------------------------------
 def illusion_sleep_dream_recall():
     anchors = _bridge_context(k_goal=1, k_facts=7, k_emergent=2)
     dream_req = {
         "phase": "dream",
         "instruction": "Based on the anchors below, speculate a concise, non-redundant synthesis (1-2 sentences) that could guide future replies.",
-        "anchors": anchors
+        "anchors": anchors,
     }
     dream = reflect_json(json.dumps(dream_req))
     if isinstance(dream, dict) and dream.get("text"):
@@ -336,12 +348,12 @@ def illusion_sleep_dream_recall():
     recall_req = {
         "phase": "recall",
         "instruction": "Distill the most concrete, non-obvious, helpful single principle derived from the dream, in plain language.",
-        "dream": dream
+        "dream": dream,
     }
     recall = reflect_json(json.dumps(recall_req))
     if isinstance(recall, dict) and recall.get("principle"):
         births_data = db.kv_get("meta.births") or {"value": "0"}
-        births = int(births_data.get("value","0")) + 1
+        births = int(births_data.get("value", "0")) + 1
         db.upsert_fact(f"emergent:{births}", recall["principle"], 0.95)
         db.kv_upsert("meta.births", {"value": str(births)})
         db.kv_upsert("illusion.last_recall", {"value": recall["principle"]})
@@ -397,16 +409,16 @@ class FeedbackPayload(BaseModel):
 
 @app.post("/feedback")
 def feedback(p: FeedbackPayload):
-    if p.signal not in ("up","down"):
-        raise HTTPException(400,"signal must be 'up' or 'down'")
-    total = (db.kv_get("reward.total") or {}).get("total",0)
+    if p.signal not in ("up", "down"):
+        raise HTTPException(400, "signal must be 'up' or 'down'")
+    total = (db.kv_get("reward.total") or {}).get("total", 0)
     total += 1 if p.signal == "up" else -1
     db.kv_upsert("reward.total", {"total": total})
     vec = db.get_policy_vector()
     if p.signal == "up":
-        vec["creativity"] = min(1.0, vec.get("creativity",0) + 0.05)
+        vec["creativity"] = min(1.0, vec.get("creativity", 0) + 0.05)
     else:
-        vec["conciseness"] = min(1.0, vec.get("conciseness",0) + 0.05)
+        vec["conciseness"] = min(1.0, vec.get("conciseness", 0) + 0.05)
     db.set_policy_vector(vec)
     _history_append({"kind": "feedback", "signal": p.signal, "reward.total": total, "policy": vec})
     return {"ok": True, "reward.total": total, "policy": vec}
@@ -422,9 +434,9 @@ def emergence_status():
         for trait in ["creativity", "conciseness", "planning_focus", "skepticism"]:
             vals = [h.get(trait, 0.0) for h in policy_hist[-10:] if isinstance(h, dict)]
             if len(vals) >= 2:
-                mean = sum(vals)/len(vals)
-                var = sum((v - mean)**2 for v in vals)/len(vals)
-                variances[trait] = round(var,4)
+                mean = sum(vals) / len(vals)
+                var = sum((v - mean) ** 2 for v in vals) / len(vals)
+                variances[trait] = round(var, 4)
 
     last_surprise = (db.kv_get("last.surprise") or {}).get("value", 0.0)
     illusion = {
@@ -501,12 +513,11 @@ def api_memory_compact():
     Soft-prune old chat records by lowering confidence on the oldest entries.
     """
     try:
-        from backend.memory import _maybe_prune
+        from backend.memory import _maybe_prune  # lazy import
         _maybe_prune()
         return {"ok": True, "msg": "memory compacted"}
     except Exception as e:
         return {"ok": False, "error": str(e)}
-
 
 # -----------------------------------------------------
 #  Memory admin endpoints (optional)
@@ -537,7 +548,7 @@ def api_goals_dedupe():
     seen = set()
     to_delete = []
     for g in goals:
-        key = " ".join(str(g.get("text","")).split()).lower()
+        key = " ".join(str(g.get("text", "")).split()).lower()
         if key in seen:
             to_delete.append(int(g.get("id", g.get("gid", -1))))
         else:
@@ -572,7 +583,7 @@ async def api_goals_add(
         try:
             js = await request.json()
             if isinstance(js, dict):
-                for k in ("text","goal","value","message"):
+                for k in ("text", "goal", "value", "message"):
                     if k in js and str(js[k]).strip():
                         text = str(js[k]).strip()
                         break
@@ -594,7 +605,7 @@ async def api_goals_add(
     if not text:
         try:
             form = await request.form()
-            for k in ("text","goal","value","message"):
+            for k in ("text", "goal", "value", "message"):
                 if k in form and str(form[k]).strip():
                     text = str(form[k]).strip()
                     break
@@ -605,13 +616,13 @@ async def api_goals_add(
         raise HTTPException(400, "Missing goal text")
 
     gid = db.goals_add(text.strip())
-    _history_append({"kind":"goal_add","id":gid,"text":text.strip()})
+    _history_append({"kind": "goal_add", "id": gid, "text": text.strip()})
     return {"status": "ok", "id": gid, "goals": db.goals_list()}
 
 @app.post("/goals/{goal_id}/activate")
 def api_goals_activate(goal_id: int):
     db.goals_activate(goal_id)
-    _history_append({"kind":"goal_activate","id":goal_id,"active":db.goal_active()})
+    _history_append({"kind": "goal_activate", "id": goal_id, "active": db.goal_active()})
     return {"status": "ok", "active": goal_id}
 
 @app.get("/goals/active")
@@ -619,30 +630,15 @@ def api_goal_active():
     return {"active": db.goal_active()}
 
 # -----------------------------------------------------
-#  AutoTick Background Thread
-# -----------------------------------------------------
-_AUTO_TICK_STARTED = False
-AUTO_TICK_ENABLED = os.getenv("AUTO_TICK", "true").lower() == "true"
-AUTO_TICK_INTERVAL = int(os.getenv("AUTO_TICK_INTERVAL", "300"))
-
-def auto_tick(interval=AUTO_TICK_INTERVAL):
-    while True:
-        try:
-            print("[AutoTick] Running planner tick...")
-            tick()
-            print("[AutoTick] Done.\n")
-        except Exception as e:
-            print("[AutoTick ERROR]", e)
-        time.sleep(interval)
-
-if AUTO_TICK_ENABLED and not _AUTO_TICK_STARTED:
-    _AUTO_TICK_STARTED = True
-    threading.Thread(target=auto_tick, daemon=True).start()
-    print(f"[AutoTick] started (interval={AUTO_TICK_INTERVAL}s)")
-
-# -----------------------------------------------------
 #  Debug endpoint: check env + network
 # -----------------------------------------------------
+def _test_internet():
+    try:
+        data = json.loads(_http_get("https://api.duckduckgo.com/?q=test&format=json", timeout=6).decode("utf-8"))
+        return {"ok": True, "len": len(data)}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
 @app.get("/debug/env")
 def debug_env():
     return {
@@ -651,28 +647,64 @@ def debug_env():
         "internet_test": _test_internet(),
     }
 
-def _test_internet():
-    try:
-        data = json.loads(_http_get("https://api.duckduckgo.com/?q=test&format=json", timeout=6).decode("utf-8"))
-        return {"ok": True, "len": len(data)}
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
-
 # -----------------------------------------------------
-#  Mount chat router last (no circular imports)
+#  Routers (mounted last to avoid circulars)
 # -----------------------------------------------------
-from backend.api import chat as chat_router
+from backend.api import chat as chat_router  # noqa: E402
 app.include_router(chat_router.router)
 
-# -----------------------------------------------------
-#  HelixBridge (file edit / commit)
-# -----------------------------------------------------
-from backend.api.github_bridge import router as github_router
+from backend.api.github_bridge import router as github_router  # noqa: E402
 app.include_router(github_router)
 
-# Self-update (prefix="/admin/self")
-from backend.api.self_update import router as self_router
+from backend.api.self_update import router as self_router  # noqa: E402
 app.include_router(self_router)
 
-from backend.api.admin_tools import router as admin_router
+from backend.api.admin_tools import router as admin_router  # noqa: E402
 app.include_router(admin_router, prefix="/admin", tags=["admin"])
+
+# -----------------------------------------------------
+#  Background: AutoTick (STARTED ON STARTUP, not at import)
+# -----------------------------------------------------
+_AUTO_TICK_STARTED = False
+AUTO_TICK_ENABLED = os.getenv("AUTO_TICK", "true").lower() == "true"
+AUTO_TICK_INTERVAL = int(os.getenv("AUTO_TICK_INTERVAL", "300"))
+
+def auto_tick(interval: int = AUTO_TICK_INTERVAL):
+    while True:
+        try:
+            logging.info("[AutoTick] Running planner tick...")
+            tick()
+            logging.info("[AutoTick] Done.")
+        except Exception as e:
+            logging.exception("[AutoTick ERROR] %s", e)
+        time.sleep(interval)
+
+# -----------------------------------------------------
+#  Startup: defer all side-effects here
+# -----------------------------------------------------
+@app.on_event("startup")
+async def _startup():
+    logging.basicConfig(level=logging.INFO)
+    # Load .env from backend directory
+    try:
+        load_dotenv(dotenv_path=Path(__file__).resolve().parent / ".env", override=True)
+    except Exception as e:
+        logging.exception("dotenv load failed (non-fatal): %s", e)
+
+    # Initialize DB and bootstrap state
+    try:
+        db.init()
+        bootstrap_defaults()
+        _snapshot_baseline_if_missing()
+    except Exception as e:
+        logging.exception("DB init/bootstrap failed (non-fatal): %s", e)
+
+    # Start background tick thread
+    global _AUTO_TICK_STARTED
+    try:
+        if AUTO_TICK_ENABLED and not _AUTO_TICK_STARTED:
+            _AUTO_TICK_STARTED = True
+            threading.Thread(target=auto_tick, daemon=True).start()
+            logging.info("[AutoTick] started (interval=%ss)", AUTO_TICK_INTERVAL)
+    except Exception as e:
+        logging.exception("Failed to start AutoTick (non-fatal): %s", e)
