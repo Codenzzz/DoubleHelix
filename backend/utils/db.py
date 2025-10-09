@@ -12,7 +12,7 @@ from sqlalchemy import (
 from sqlalchemy.orm import sessionmaker, declarative_base, scoped_session
 
 # ---------------------------------------------------------------------
-# Engine / Session
+# Engine / Session (lazy init to avoid import-time errors)
 # ---------------------------------------------------------------------
 DB_PATH = os.getenv(
     "SQLITE_PATH",
@@ -20,32 +20,41 @@ DB_PATH = os.getenv(
 )
 DATABASE_URL = os.getenv("DATABASE_URL", f"sqlite:///{DB_PATH}").strip()
 
-# 1) Ensure psycopg2 driver if Postgres URL is bare
-if DATABASE_URL.startswith("postgresql://") and "+psycopg2" not in DATABASE_URL:
-    DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+psycopg2://", 1)
-
-# 2) Ensure SSL for Supabase (or when POSTGRES_REQUIRE_SSL=true)
 def _ensure_ssl(url: str) -> str:
     if not url.startswith("postgresql+psycopg2://"):
         return url
     must_ssl = os.getenv("POSTGRES_REQUIRE_SSL", "").lower() in ("1", "true", "yes") or ("supabase.co" in url)
     if not must_ssl:
         return url
-    # append sslmode=require if missing
     if "sslmode=" not in url:
         sep = "&" if "?" in url else "?"
         url = f"{url}{sep}sslmode=require"
     return url
 
-DATABASE_URL = _ensure_ssl(DATABASE_URL)
+def _create_engine() -> "Engine":
+    from sqlalchemy import create_engine
+    url = DATABASE_URL
+    if url.startswith("postgresql://") and "+psycopg2" not in url:
+        url = url.replace("postgresql://", "postgresql+psycopg2://", 1)
+    url = _ensure_ssl(url)
+    connect_args = {"check_same_thread": False} if url.startswith("sqlite:///") else {}
+    return create_engine(url, pool_pre_ping=True, connect_args=connect_args)
 
-# 3) Connect args: only for SQLite (FastAPI + background threads)
-connect_args = {"check_same_thread": False} if DATABASE_URL.startswith("sqlite:///") else {}
-
-# 4) Create engine (pre-ping helps with long-lived connections)
-engine = create_engine(DATABASE_URL, pool_pre_ping=True, connect_args=connect_args)
-SessionLocal = scoped_session(sessionmaker(bind=engine, autocommit=False, autoflush=False))
+# Lazily initialized globals
+engine = None
+SessionLocal = None
 Base = declarative_base()
+
+def init():
+    """Initialize database engine & tables safely at runtime."""
+    global engine, SessionLocal
+    if engine is None:
+        engine = _create_engine()
+        SessionLocal = scoped_session(sessionmaker(bind=engine, autocommit=False, autoflush=False))
+        if DATABASE_URL.startswith("sqlite:///"):
+            os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+        Base.metadata.create_all(bind=engine)
+
 
 
 def _now_str() -> str:
@@ -90,14 +99,6 @@ class Goal(Base):
     active = Column(Boolean, nullable=False, default=False)
     ts = Column(String, nullable=False)
 
-
-# ---------------------------------------------------------------------
-# Init
-# ---------------------------------------------------------------------
-def init():
-    if DATABASE_URL.startswith("sqlite:///"):
-        os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
-    Base.metadata.create_all(bind=engine)
 
 
 # ---------------------------------------------------------------------
