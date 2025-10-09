@@ -6,7 +6,7 @@ from pydantic import BaseModel
 from pathlib import Path
 import os, time, hashlib, base64, requests
 # 🔒 STRICT import — fail if verify isn’t available
-from api.helix_verify import require_scopes
+from backend.api.helix_verify import require_scopes
 
 # --- Auth: require "admin.github" scope ---
 try:
