@@ -1,4 +1,4 @@
-# api/self_update.py
+﻿# api/self_update.py
 from fastapi import APIRouter, Body, HTTPException
 from api.github_bridge import EditReq, edit_file
 import os

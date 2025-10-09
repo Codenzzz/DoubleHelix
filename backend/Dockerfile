@@ -1,18 +1,20 @@
 ﻿FROM python:3.11-slim
 
-# Set the working directory explicitly to /app/backend
+# Set working directory
 WORKDIR /app
 
 # Install dependencies
 COPY backend/requirements.txt ./requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy everything into /app
+# Copy the entire project
 COPY . .
+
+# Ensure backend is in Python path
+ENV PYTHONPATH=/app
 
 EXPOSE 8000
 
-# ✅ ENTRYPOINT FIX: ensure correct import path
+# Launch from /app/backend but import backend.main:app
 WORKDIR /app/backend
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
-
+CMD ["python", "-m", "uvicorn", "backend.main:app", "--host", "0.0.0.0", "--port", "8000"]
