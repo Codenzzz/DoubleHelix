@@ -1,9 +1,9 @@
 # backend/api/ops_ui.py
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, Form
-from fastapi.responses import HTMLResponse
-from backend.api.helix_verify import require_scopes
+from fastapi import APIRouter, Form, HTTPException
+from fastapi.responses import HTMLResponse, JSONResponse
+from backend.api.helix_verify import _decode_bearer
 from backend.api.github_bridge import EditReq, edit_file
 
 router = APIRouter(prefix="/ops", tags=["ops"])
@@ -20,11 +20,15 @@ HTML = """<!doctype html>
   small{color:#666} label{font-weight:600}
   pre{white-space:pre-wrap;word-wrap:anywhere;background:#0001;padding:1rem;border-radius:10px}
 </style>
+
 <h1>Helix Ops</h1>
-<p><small>Edits go through your secured bridge. Auth required.</small></p>
+<p><small>The page is public, but actions require a JWT with <code>admin.github</code>.
+Paste your token below for each action.</small></p>
 
 <h2>Local write (no Git push)</h2>
 <form method="post" action="/ops/local">
+  <label>JWT token (admin.github)</label>
+  <input name="token" placeholder="eyJhbGciOi...">
   <label>Path (repo-relative)</label>
   <input name="path" placeholder="backend/api/new_module.py" required>
   <label>Message</label>
@@ -36,6 +40,8 @@ HTML = """<!doctype html>
 
 <h2>Write + GitHub push</h2>
 <form method="post" action="/ops/push">
+  <label>JWT token (admin.github)</label>
+  <input name="token" placeholder="eyJhbGciOi...">
   <label>Path (repo-relative)</label>
   <input name="path" placeholder="backend/api/new_module.py" required>
   <label>Commit message</label>
@@ -46,18 +52,37 @@ HTML = """<!doctype html>
 </form>
 """
 
-@router.get("", response_class=HTMLResponse, dependencies=[Depends(require_scopes(["admin.github"]))])
+def _verify_token_or_403(token: str | None, need_scope: str = "admin.github"):
+    if not token:
+        raise HTTPException(401, "Missing token")
+    claims = _decode_bearer(f"Bearer {token}")
+    scopes = set(claims.get("scopes", []))
+    if need_scope not in scopes:
+        raise HTTPException(403, f"Missing scope: {need_scope}")
+    return claims
+
+@router.get("", response_class=HTMLResponse)
 def ops_index():
     return HTML
 
-@router.post("/local", response_class=HTMLResponse, dependencies=[Depends(require_scopes(["admin.github"]))])
-def ops_local(path: str = Form(...), message: str = Form("ops: local edit"), content: str = Form(...)):
-    req = EditReq(path=path, content=content, message=message, push=False)
-    result = edit_file(req)
-    return f"<pre>{result}</pre><p><a href='/ops'>Back</a></p>"
+@router.post("/local", response_class=HTMLResponse)
+def ops_local(
+    token: str | None = Form(None),
+    path: str = Form(...),
+    message: str = Form("ops: local edit"),
+    content: str = Form(...)
+):
+    _verify_token_or_403(token, "admin.github")
+    res = edit_file(EditReq(path=path, content=content, message=message, push=False))
+    return HTMLResponse(f"<h3>Local write OK</h3><pre>{res}</pre>")
 
-@router.post("/push", response_class=HTMLResponse, dependencies=[Depends(require_scopes(["admin.github"]))])
-def ops_push(path: str = Form(...), message: str = Form("ops: push edit"), content: str = Form(...)):
-    req = EditReq(path=path, content=content, message=message, push=True)
-    result = edit_file(req)
-    return f"<pre>{result}</pre><p><a href='/ops'>Back</a></p>"
+@router.post("/push", response_class=HTMLResponse)
+def ops_push(
+    token: str | None = Form(None),
+    path: str = Form(...),
+    message: str = Form("ops: push edit"),
+    content: str = Form(...)
+):
+    _verify_token_or_403(token, "admin.github")
+    res = edit_file(EditReq(path=path, content=content, message=message, push=True))
+    return HTMLResponse(f"<h3>Write + Push OK</h3><pre>{res}</pre>")
