@@ -1,4 +1,4 @@
-﻿# backend/api/github_bridge.py
+# backend/api/github_bridge.py
 from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -6,13 +6,13 @@ from pydantic import BaseModel
 from pathlib import Path
 import os, time, hashlib, base64, requests
 
-# 🔒 Strict auth import (no permissive fallback)
+# Strict auth (no permissive fallback)
 from backend.api.helix_verify import require_scopes
 
 router = APIRouter(prefix="/admin/github", tags=["admin:github"])
 
 class EditReq(BaseModel):
-    path: str                  # repo-relative path, e.g. "api/bridge_test2.txt" or "backend/main.py"
+    path: str                  # repo-relative, e.g. "api/bridge_test2.txt" or "backend/main.py"
     content: str               # full file contents
     message: str = "Bridge commit"
     branch: str | None = None  # defaults to env GITHUB_BRANCH or "main"
@@ -53,35 +53,58 @@ def _gh_upsert_file(repo: str, path: str, branch: str, message: str, content_str
     b64 = base64.b64encode(content_str.encode("utf-8")).decode("ascii")
     sha = _gh_get_file_sha(repo, path, branch, token)
     url = f"https://api.github.com/repos/{repo}/contents/{path}"
-    payload = {"message": message, "content": b64, "branch": branch, **({"sha": sha} if sha else {})}
+    payload = {
+        "message": message,
+        "content": b64,
+        "branch": branch,
+        **({"sha": sha} if sha else {}),
+    }
     r = requests.put(url, json=payload, headers=_gh_headers(token), timeout=30)
     if r.status_code not in (200, 201):
         raise HTTPException(r.status_code, f"GitHub commit failed: {r.text}")
     j = r.json()
-    commit = (j.get("commit") or {})
+    commit = j.get("commit") or {}
     html_url = commit.get("html_url")
-    return {"committed": True, "path": path, "branch": branch, "sha": (j.get("content") or {}).get("sha"), "commit_url": html_url}
+    return {
+        "committed": True,
+        "path": path,
+        "branch": branch,
+        "sha": (j.get("content") or {}).get("sha"),
+        "commit_url": html_url,
+    }
 
-# 🔐 SECURED routes
 @router.get("/ping", dependencies=[Depends(require_scopes(["admin.github"]))])
 def ping():
     user, repo, token, branch = _gh_cfg()
-    return {"ok": True, "module": "github_bridge", "ts": time.time(),
-            "env": {"user": bool(user), "repo": bool(repo), "token": bool(token), "branch": branch}}
+    return {
+        "ok": True,
+        "module": "github_bridge",
+        "ts": time.time(),
+        "env": {"user": bool(user), "repo": bool(repo), "token": bool(token), "branch": branch},
+    }
 
 @router.post("/edit", dependencies=[Depends(require_scopes(["admin.github"]))])
 def edit_file(req: EditReq):
+    # 1) Always write locally (predictable local dev)
     target = _safe_local_path(req.path)
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(req.content, encoding="utf-8")
     sha_local = hashlib.sha256(req.content.encode("utf-8")).hexdigest()
 
+    # 2) Optionally push to GitHub
     if req.push:
         user, repo, token, default_branch = _gh_cfg()
         branch = req.branch or default_branch or "main"
         if not (repo and token):
             raise HTTPException(400, "Missing GITHUB_TOKEN or GITHUB_REPO")
-        gh = _gh_upsert_file(repo=repo, path=req.path, branch=branch, message=req.message, content_str=req.content, token=token)
+        gh = _gh_upsert_file(
+            repo=repo,
+            path=req.path,
+            branch=branch,
+            message=req.message,
+            content_str=req.content,
+            token=token,
+        )
         return {"ok": True, "mode": "local+github", "path": str(target), "sha256": sha_local, **gh}
-
-    return {"ok": True, "mode": "local-only", "path": str(target), "sha256": sha_local}
+    else:
+        return {"ok": True, "mode": "local-only", "path": str(target), "sha256": sha_local}
