@@ -1,22 +1,23 @@
 ﻿FROM python:3.11-slim
 
-# Set working directory
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+
+# Work from /app
 WORKDIR /app
 
-# Install dependencies
+# Install dependencies first (layer cache)
 COPY backend/requirements.txt ./requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy the entire project
+# Copy the entire repo into the image
 COPY . .
 
-# Ensure backend is in Python path
+# Make sure Python can import from /app
 ENV PYTHONPATH=/app
 
-EXPOSE 8000
+# (optional) sanity check during build — fails early if imports break
+RUN python -c "import importlib; importlib.import_module('backend.main'); print('import ok')"
 
-# Launch from /app/backend but import backend.main:app
-WORKDIR /app
-ENV PYTHONPATH=/app
 EXPOSE 8000
-CMD ["python", "-m", "uvicorn", "backend.main:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["uvicorn", "backend.main:app", "--host", "0.0.0.0", "--port", "8000"]
