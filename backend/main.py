@@ -39,6 +39,9 @@ except Exception:  # dotenv optional at runtime
 # =====================================================
 app = FastAPI(title="DoubleHelix API", version="0.9.1")
 
+
+from backend.api.ops_ui import router as ops_router
+app.include_router(ops_router)
 # -----------------------------------------------------
 #  CORS (Env + Fallback)
 # -----------------------------------------------------
