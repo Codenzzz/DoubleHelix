@@ -1,0 +1,190 @@
+awesome idea. here’s a drop-in README_HELIX.md you can paste/push so future-you (or a fresh window) knows exactly how to drive this setup.
+
+Use this PowerShell one-liner to commit it fast:
+
+Helix-Edit -Path "backend/README_HELIX.md" -Message "docs: add Helix bridge cheatsheet" -Push:$true -Content @'
+# DoubleHelix – Bridge & Ops Cheatsheet
+
+This repo is wired so you can edit files from chat/terminal and even push to GitHub without opening VS Code.
+
+---
+
+## What’s set up
+
+- **JWT auth**: `backend/api/helix_verify.py` (HS256: `HELIXBRIDGE_JWT_SECRET`, `JWT_ISS=helix`, `JWT_AUD=helix-clients`).
+- **GitHub bridge**: `backend/api/github_bridge.py`
+  - `POST /admin/github/edit` writes locally and (optionally) commits to GitHub.
+  - Requires JWT scope: `admin.github`.
+- **Ops UI**: `GET /ops`
+  - Public HTML form, but actions require a JWT pasted into the form.
+  - Two forms: “Local write” and “Write + GitHub push”.
+- **Memory DB**: simple key/value & notes endpoints (not detailed here).
+- **CORS** configured for Render & localhost.
+
+---
+
+## Quickstart
+
+### 1) Mint a JWT
+```powershell
+# Helper in $PROFILE:
+New-HelixToken
+# outputs: Saved TOKEN (exp=...) with scopes: admin.github, memory.read, memory.write
+# token is stored in $env:TOKEN
+
+2) Ping the bridge
+Helix-Call -Method GET -Path "/admin/github/ping"
+
+3) Edit a file (local only)
+Helix-Edit -Path "api/notes.txt" -Content "hello from bridge" -Message "note" -Push:$false
+
+4) Edit + push to GitHub
+Helix-Edit -Path "backend/README.md" -Content "# updated via bridge" -Message "docs: update via bridge" -Push:$true
+
+5) Use the Ops UI (browser)
+
+Visit: https://doublehelix.onrender.com/ops
+
+Paste your JWT (from New-HelixToken) into the JWT token field.
+
+Fill Path, Message, Content → submit.
+
+If you see {"detail":"Missing Bearer token"}, you opened an older JSON view.
+Refresh, make sure you’re on the HTML page, and paste the token into the form.
+
+PowerShell helpers (already in $PROFILE)
+function New-HelixToken {
+  param(
+    [string[]]$Scopes = @("admin.github","memory.read","memory.write"),
+    [string]$Base = "https://doublehelix.onrender.com"
+  )
+  $body = @{ sub="chatgpt"; scopes=$Scopes } | ConvertTo-Json
+  $tok  = Invoke-RestMethod -Uri "$Base/auth/issue" -Method POST -ContentType "application/json" -Body $body
+  $env:TOKEN = $tok.token
+  "Saved TOKEN (exp=$($tok.exp)) with scopes: $($tok.scopes -join ', ')"
+}
+
+function Helix-Call {
+  param(
+    [Parameter(Mandatory=$true)][string]$Method,
+    [Parameter(Mandatory=$true)][string]$Path,
+    [hashtable]$Body = @{},
+    [string]$Base = "https://doublehelix.onrender.com"
+  )
+  if (-not $env:TOKEN) { throw "No TOKEN. Run New-HelixToken first." }
+  $uri = "$Base$Path"
+  if ($Method -match '^(GET|DELETE)$') {
+    Invoke-RestMethod -Uri $uri -Method $Method -Headers @{ Authorization = "Bearer $env:TOKEN" }
+  } else {
+    $json = if ($Body.Count) { ($Body | ConvertTo-Json) } else { '{}' }
+    Invoke-RestMethod -Uri $uri -Method $Method -ContentType "application/json" -Headers @{ Authorization = "Bearer $env:TOKEN" } -Body $json
+  }
+}
+
+function Helix-Edit {
+  param(
+    [Parameter(Mandatory=$true)][string]$Path,
+    [Parameter(Mandatory=$true)][string]$Content,
+    [string]$Message = "bridge edit",
+    [bool]$Push = $false,
+    [string]$Base = "https://doublehelix.onrender.com"
+  )
+  if (-not $env:TOKEN) { throw "No TOKEN. Run New-HelixToken first." }
+  $body = @{ path=$Path; content=$Content; message=$Message; push=$Push } | ConvertTo-Json
+  Invoke-RestMethod -Uri "$Base/admin/github/edit" -Method POST -ContentType "application/json" -Headers @{ Authorization = "Bearer $env:TOKEN" } -Body $body
+}
+
+Env vars (Render)
+
+GITHUB_REPO = owner/repo
+
+GITHUB_TOKEN = PAT with repo scope
+
+GITHUB_BRANCH = main
+
+HELIXBRIDGE_JWT_SECRET = long random hex (keep private)
+
+JWT_ISS = helix
+
+JWT_AUD = helix-clients
+
+ALLOW_FULL_ACCESS = false
+
+HELIX_FULL_ACCESS_CLIENT = chatgpt (only used if full access allowed)
+
+For Ops UI Form: add to backend/requirements.txt → python-multipart>=0.0.9
+
+Do not commit secrets. Keep them only in Render environment settings.
+
+Useful endpoints
+
+Health: GET /healthz
+
+GitHub bridge ping: GET /admin/github/ping
+
+Edit file: POST /admin/github/edit
+
+Issue JWT: POST /auth/issue
+
+Ops console: GET /ops
+
+File fetch (server-side trigger)
+
+If enabled:
+
+GET /admin/files/get?path=<repo-relative>&token=<HELIX_TRIGGER_SECRET>&max_bytes=200000
+
+
+HELIX_TRIGGER_SECRET must match Render env value. Don’t put the secret in README.
+
+Recent changes (timeline)
+
+Added strict JWT scope verification (backend/api/helix_verify.py).
+
+Added GitHub bridge with local+push modes (backend/api/github_bridge.py).
+
+Added /ops HTML console to write or write+push via browser.
+
+Added PowerShell helpers: New-HelixToken, Helix-Call, Helix-Edit.
+
+Fixed import paths for container build; base64 GitHub upsert; timeouts.
+
+Ensured python-multipart is included for FastAPI Form support.
+
+“Hello” example (via Ops UI)
+
+Create backend/api/hello_ops.py:
+
+from fastapi import APIRouter
+router = APIRouter(prefix="/hello", tags=["hello"])
+
+@router.get("")
+def hello():
+    return {"hello": "from ops"}
+
+
+Wire it in backend/main.py:
+
+from backend.api.hello_ops import router as hello_router
+app.include_router(hello_router)
+
+
+Deploy → open /hello.
+
+Troubleshooting
+
+401 Unauthorized on /ops submit → paste a fresh JWT into the form.
+
+Missing Bearer token JSON page → you’re not on the HTML form or didn’t paste JWT.
+
+Render build error: python-multipart missing → add to backend/requirements.txt.
+
+Git push rejected (fetch first) → git pull locally (if you’re also pushing from your machine).
+
+Perm errors on path → the bridge prevents escaping repo root.
+
+Happy hacking! 🚀
+'@
+
+
+That will create and push `backend/README_HELIX.md` with everything we’ve set up, plus the shortcuts and e
