@@ -520,22 +520,26 @@ def api_memory_compact():
         return {"ok": False, "error": str(e)}
 
 # -----------------------------------------------------
-#  Memory clock endpoint (frontend heartbeat)
+#  Memory clock (frontend heartbeat)
 # -----------------------------------------------------
-from memory import update_clock, get_clock  # ?? make sure this import is near the top of main.py
+CLOCK_STATE = {"last": None, "events": []}
+
+def update_clock(event: str = "ping"):
+    import time
+    CLOCK_STATE["last"] = time.strftime("%Y-%m-%d %H:%M:%S")
+    CLOCK_STATE["events"].append(event)
+    CLOCK_STATE["events"] = CLOCK_STATE["events"][-10:]
+
+def get_clock():
+    return CLOCK_STATE
 
 class ClockIn(BaseModel):
     event: Optional[str] = "manual_ping"
 
 @app.post("/memory/clock")
 def api_memory_clock(p: ClockIn):
-    """
-    Update and return the memory clock. 
-    Used by frontend to keep backend alive and sync state.
-    """
-    update_clock(event=p.event)
+    update_clock(p.event)
     return {"ok": True, "clock": get_clock()}
-
 
 # -----------------------------------------------------
 #  Memory admin endpoints (optional)
