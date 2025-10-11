@@ -80,8 +80,11 @@ def openai_chat_many(
         "model": model or DEFAULT_MODEL,
         "messages": messages,
         "n": n,
-        "temperature": 0.7,
     }
+
+    # 🚨 GPT-5 does not support custom temperature
+    if (model or DEFAULT_MODEL) != "gpt-5":
+        body["temperature"] = 0.7
 
     try:
         with _client() as client:
@@ -124,7 +127,12 @@ def openai_reflect_json(prompt: str, model: str = DEFAULT_MODEL) -> Dict:
         {"role": "system", "content": sys_msg},
         {"role": "user", "content": str(prompt)},
     ]
-    body = {"model": model or DEFAULT_MODEL, "messages": messages, "temperature": 0.2}
+
+    body = {"model": model or DEFAULT_MODEL, "messages": messages}
+
+    # 🚨 GPT-5 does not support custom temperature
+    if (model or DEFAULT_MODEL) != "gpt-5":
+        body["temperature"] = 0.2
 
     try:
         with _client() as client:
