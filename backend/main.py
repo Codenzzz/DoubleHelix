@@ -1,4 +1,4 @@
-﻿# backend/main.py
+# backend/main.py
 # Import-safe FastAPI app for Render (no side-effects at import time)
 
 from __future__ import annotations
@@ -35,13 +35,10 @@ except Exception:  # dotenv optional at runtime
         return False
 
 # =====================================================
-#  DoubleHelix API — Emergent Reflection Engine (v0.9.1)
+#  DoubleHelix API - Emergent Reflection Engine (v0.9.1)
 # =====================================================
 app = FastAPI(title="DoubleHelix API", version="0.9.1")
 
-
-from backend.api.ops_ui import router as ops_router
-app.include_router(ops_router)
 # -----------------------------------------------------
 #  CORS (Env + Fallback)
 # -----------------------------------------------------
@@ -335,7 +332,7 @@ def _should_bridge() -> bool:
     return last_surprise >= bridge_s or max_var >= bridge_v
 
 # -----------------------------------------------------
-#  Illusion Loop (sleep → dream → recall)
+#  Illusion Loop (sleep ? dream ? recall)
 # -----------------------------------------------------
 def illusion_sleep_dream_recall():
     anchors = _bridge_context(k_goal=1, k_facts=7, k_emergent=2)
@@ -521,6 +518,24 @@ def api_memory_compact():
         return {"ok": True, "msg": "memory compacted"}
     except Exception as e:
         return {"ok": False, "error": str(e)}
+
+# -----------------------------------------------------
+#  Memory clock endpoint (frontend heartbeat)
+# -----------------------------------------------------
+from memory import update_clock, get_clock  # ?? make sure this import is near the top of main.py
+
+class ClockIn(BaseModel):
+    event: Optional[str] = "manual_ping"
+
+@app.post("/memory/clock")
+def api_memory_clock(p: ClockIn):
+    """
+    Update and return the memory clock. 
+    Used by frontend to keep backend alive and sync state.
+    """
+    update_clock(event=p.event)
+    return {"ok": True, "clock": get_clock()}
+
 
 # -----------------------------------------------------
 #  Memory admin endpoints (optional)
